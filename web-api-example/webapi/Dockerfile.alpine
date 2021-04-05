@@ -1,0 +1,30 @@
+FROM mcr.microsoft.com/dotnet/sdk:5.0-alpine AS build-env
+
+# Install the tools
+RUN dotnet tool install --tool-path /tools dotnet-trace
+RUN dotnet tool install --tool-path /tools dotnet-dump
+RUN dotnet tool install --tool-path /tools dotnet-counters
+RUN dotnet tool install --tool-path /tools dotnet-symbol
+
+WORKDIR /app
+COPY . .
+
+RUN dotnet restore
+
+RUN dotnet publish -c Release -o /app/out
+
+################################################
+FROM mcr.microsoft.com/dotnet/aspnet:5.0-alpine
+ENV LANG=en_US.UTF-8
+ENV ASPNETCORE_URLS=http://*:80
+
+COPY --from=build-env /tools /tools
+
+WORKDIR /app
+COPY --from=build-env /app/out .
+
+EXPOSE 80
+
+ENV COMPlus_PerfMapEnabled=1
+
+ENTRYPOINT ["dotnet", "webapi.dll"]

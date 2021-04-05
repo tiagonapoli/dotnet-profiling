@@ -1,0 +1,3288 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="1046" onload="init(evt)" viewBox="0 0 1200 1046" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="1046.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="1029" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="1029" > </text>
+<g id="frames">
+<g >
+<title>switch_fpu_return (13 samples, 0.09%)</title><rect x="25.6" y="885" width="1.1" height="15.0" fill="rgb(243,165,46)" rx="2" ry="2" />
+<text  x="28.57" y="895.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge.constprop.0 (4 samples, 0.03%)</title><rect x="1172.4" y="277" width="0.3" height="15.0" fill="rgb(224,27,50)" rx="2" ry="2" />
+<text  x="1175.40" y="287.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure.Heartbeat+&lt;&gt;c::&lt;.ctor&gt;b__8_0 (2 samples, 0.01%)</title><rect x="1189.8" y="805" width="0.2" height="15.0" fill="rgb(220,47,29)" rx="2" ry="2" />
+<text  x="1192.83" y="815.5" ></text>
+</g>
+<g >
+<title>merge_sched_in (4 samples, 0.03%)</title><rect x="1187.8" y="741" width="0.3" height="15.0" fill="rgb(221,73,2)" rx="2" ry="2" />
+<text  x="1190.80" y="751.5" ></text>
+</g>
+<g >
+<title>ThreadpoolMgr::TimerThreadFire (3 samples, 0.02%)</title><rect x="1188.1" y="917" width="0.3" height="15.0" fill="rgb(207,139,44)" rx="2" ry="2" />
+<text  x="1191.14" y="927.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker::InvokeInnerFilterAsync (12,254 samples, 87.87%)</title><rect x="139.7" y="613" width="1036.8" height="15.0" fill="rgb(235,27,3)" rx="2" ry="2" />
+<text  x="142.71" y="623.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerAct..</text>
+</g>
+<g >
+<title>__prepare_exit_to_usermode (20 samples, 0.14%)</title><rect x="1174.1" y="389" width="1.7" height="15.0" fill="rgb(253,71,49)" rx="2" ry="2" />
+<text  x="1177.09" y="399.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (6 samples, 0.04%)</title><rect x="18.9" y="949" width="0.5" height="15.0" fill="rgb(244,16,6)" rx="2" ry="2" />
+<text  x="21.88" y="959.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.TimerQueueTimer::Fire (7 samples, 0.05%)</title><rect x="1181.0" y="773" width="0.6" height="15.0" fill="rgb(214,192,53)" rx="2" ry="2" />
+<text  x="1184.03" y="783.5" ></text>
+</g>
+<g >
+<title>sysvec_call_function_single (12 samples, 0.09%)</title><rect x="1172.7" y="437" width="1.1" height="15.0" fill="rgb(250,193,9)" rx="2" ry="2" />
+<text  x="1175.74" y="447.5" ></text>
+</g>
+<g >
+<title>native_sched_clock (8 samples, 0.06%)</title><rect x="90.6" y="645" width="0.6" height="15.0" fill="rgb(211,227,17)" rx="2" ry="2" />
+<text  x="93.55" y="655.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (8 samples, 0.06%)</title><rect x="1187.5" y="949" width="0.6" height="15.0" fill="rgb(216,180,38)" rx="2" ry="2" />
+<text  x="1190.46" y="959.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (16 samples, 0.11%)</title><rect x="1188.5" y="949" width="1.3" height="15.0" fill="rgb(243,12,2)" rx="2" ry="2" />
+<text  x="1191.48" y="959.5" ></text>
+</g>
+<g >
+<title>schedule (787 samples, 5.64%)</title><rect x="30.0" y="853" width="66.6" height="15.0" fill="rgb(210,74,54)" rx="2" ry="2" />
+<text  x="32.97" y="863.5" >schedule</text>
+</g>
+<g >
+<title>perf_pmu_nop_int (8 samples, 0.06%)</title><rect x="93.3" y="741" width="0.6" height="15.0" fill="rgb(226,10,48)" rx="2" ry="2" />
+<text  x="96.26" y="751.5" ></text>
+</g>
+<g >
+<title>__secure_computing (4 samples, 0.03%)</title><rect x="21.0" y="901" width="0.3" height="15.0" fill="rgb(224,53,35)" rx="2" ry="2" />
+<text  x="24.00" y="911.5" ></text>
+</g>
+<g >
+<title>__libc_read (5 samples, 0.04%)</title><rect x="18.1" y="949" width="0.4" height="15.0" fill="rgb(249,163,53)" rx="2" ry="2" />
+<text  x="21.12" y="959.5" ></text>
+</g>
+<g >
+<title>do_futex (2 samples, 0.01%)</title><rect x="16.5" y="901" width="0.2" height="15.0" fill="rgb(248,4,27)" rx="2" ry="2" />
+<text  x="19.52" y="911.5" ></text>
+</g>
+<g >
+<title>instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;valuetype System.IO.Pipelines.FlushResult&gt; [System.IO.Pipelines] System.IO.Pipelines.Pipe+DefaultPipeWriter::FlushAsync (3 samples, 0.02%)</title><rect x="1177.6" y="405" width="0.2" height="15.0" fill="rgb(224,52,31)" rx="2" ry="2" />
+<text  x="1180.56" y="415.5" ></text>
+</g>
+<g >
+<title>tcp_v4_do_rcv (3 samples, 0.02%)</title><rect x="20.2" y="197" width="0.2" height="15.0" fill="rgb(244,108,50)" rx="2" ry="2" />
+<text  x="23.15" y="207.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker::InvokeResultFilters (25 samples, 0.18%)</title><rect x="1176.5" y="613" width="2.2" height="15.0" fill="rgb(219,64,45)" rx="2" ry="2" />
+<text  x="1179.55" y="623.5" ></text>
+</g>
+<g >
+<title>br_handle_frame (3 samples, 0.02%)</title><rect x="19.1" y="501" width="0.2" height="15.0" fill="rgb(228,116,37)" rx="2" ry="2" />
+<text  x="22.05" y="511.5" ></text>
+</g>
+<g >
+<title>set_next_task_idle (3 samples, 0.02%)</title><rect x="96.0" y="805" width="0.2" height="15.0" fill="rgb(232,214,16)" rx="2" ry="2" />
+<text  x="98.97" y="815.5" ></text>
+</g>
+<g >
+<title>amd_pmu_disable_all (2 samples, 0.01%)</title><rect x="103.2" y="741" width="0.1" height="15.0" fill="rgb(249,160,5)" rx="2" ry="2" />
+<text  x="106.16" y="751.5" ></text>
+</g>
+<g >
+<title>rb_erase (25 samples, 0.18%)</title><rect x="98.3" y="821" width="2.2" height="15.0" fill="rgb(230,228,29)" rx="2" ry="2" />
+<text  x="101.34" y="831.5" ></text>
+</g>
+<g >
+<title>instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;valuetype [System.IO.Pipelines]System.IO.Pipelines.FlushResult&gt; [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpResponsePipeWriter::FlushAsync (3 samples, 0.02%)</title><rect x="1177.6" y="485" width="0.2" height="15.0" fill="rgb(207,16,33)" rx="2" ry="2" />
+<text  x="1180.56" y="495.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Routing] Microsoft.AspNetCore.Routing.EndpointMiddleware::Invoke (12,284 samples, 88.08%)</title><rect x="139.6" y="693" width="1039.4" height="15.0" fill="rgb(238,179,10)" rx="2" ry="2" />
+<text  x="142.63" y="703.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Routing] Microsoft.AspNetCore.Routing.EndpointMiddleware::Invoke</text>
+</g>
+<g >
+<title>.NET_Sockets (80 samples, 0.57%)</title><rect x="10.3" y="981" width="6.8" height="15.0" fill="rgb(233,8,37)" rx="2" ry="2" />
+<text  x="13.34" y="991.5" ></text>
+</g>
+<g >
+<title>instance void [System.Net.Sockets] System.Net.Sockets.SocketAsyncEngine::System.Threading.IThreadPoolWorkItem.Execute (6 samples, 0.04%)</title><rect x="138.3" y="805" width="0.5" height="15.0" fill="rgb(210,12,5)" rx="2" ry="2" />
+<text  x="141.27" y="815.5" ></text>
+</g>
+<g >
+<title>__lll_unlock_wake (13 samples, 0.09%)</title><rect x="129.3" y="853" width="1.1" height="15.0" fill="rgb(217,70,44)" rx="2" ry="2" />
+<text  x="132.30" y="863.5" ></text>
+</g>
+<g >
+<title>ManagedThreadBase_DispatchOuter (5 samples, 0.04%)</title><rect x="16.7" y="901" width="0.4" height="15.0" fill="rgb(243,31,44)" rx="2" ry="2" />
+<text  x="19.68" y="911.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (8 samples, 0.06%)</title><rect x="1174.4" y="341" width="0.7" height="15.0" fill="rgb(240,163,30)" rx="2" ry="2" />
+<text  x="1177.43" y="351.5" ></text>
+</g>
+<g >
+<title>sock_recvmsg (6 samples, 0.04%)</title><rect x="18.9" y="885" width="0.5" height="15.0" fill="rgb(225,162,35)" rx="2" ry="2" />
+<text  x="21.88" y="895.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Authorization.Policy] Microsoft.AspNetCore.Authorization.AuthorizationMiddleware+&lt;Invoke&gt;d__6::MoveNext (12,286 samples, 88.10%)</title><rect x="139.5" y="709" width="1039.5" height="15.0" fill="rgb(248,209,41)" rx="2" ry="2" />
+<text  x="142.46" y="719.5" >instance void [Microsoft.AspNetCore.Authorization.Policy] Microsoft.AspNetCore.Authorization.AuthorizationMiddleware+&lt;Invoke&gt;d__6::MoveNext</text>
+</g>
+<g >
+<title>x86_pmu_disable (4 samples, 0.03%)</title><rect x="1170.3" y="277" width="0.3" height="15.0" fill="rgb(233,25,45)" rx="2" ry="2" />
+<text  x="1173.29" y="287.5" ></text>
+</g>
+<g >
+<title>__local_bh_enable_ip (3 samples, 0.02%)</title><rect x="19.1" y="661" width="0.2" height="15.0" fill="rgb(235,37,43)" rx="2" ry="2" />
+<text  x="22.05" y="671.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (23 samples, 0.16%)</title><rect x="1170.8" y="405" width="1.9" height="15.0" fill="rgb(225,58,21)" rx="2" ry="2" />
+<text  x="1173.79" y="415.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (5 samples, 0.04%)</title><rect x="18.1" y="917" width="0.4" height="15.0" fill="rgb(221,24,54)" rx="2" ry="2" />
+<text  x="21.12" y="927.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure.Heartbeat::OnHeartbeat (2 samples, 0.01%)</title><rect x="1189.8" y="773" width="0.2" height="15.0" fill="rgb(217,180,1)" rx="2" ry="2" />
+<text  x="1192.83" y="783.5" ></text>
+</g>
+<g >
+<title>instance bool [System.Private.CoreLib] System.Threading.ManualResetEventSlim::Wait (8 samples, 0.06%)</title><rect x="140.1" y="405" width="0.7" height="15.0" fill="rgb(244,205,18)" rx="2" ry="2" />
+<text  x="143.13" y="415.5" ></text>
+</g>
+<g >
+<title>do_softirq.part.0 (4 samples, 0.03%)</title><rect x="20.1" y="629" width="0.3" height="15.0" fill="rgb(250,223,8)" rx="2" ry="2" />
+<text  x="23.07" y="639.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (16 samples, 0.11%)</title><rect x="1188.5" y="821" width="1.3" height="15.0" fill="rgb(231,2,35)" rx="2" ry="2" />
+<text  x="1191.48" y="831.5" ></text>
+</g>
+<g >
+<title>instance void [System.Net.Sockets] System.Net.Sockets.SocketAsyncEngine+&lt;&gt;c::&lt;.ctor&gt;b__14_0 (5 samples, 0.04%)</title><rect x="16.7" y="837" width="0.4" height="15.0" fill="rgb(219,130,32)" rx="2" ry="2" />
+<text  x="19.68" y="847.5" ></text>
+</g>
+<g >
+<title>amd_pmu_wait_on_overflow (3 samples, 0.02%)</title><rect x="31.2" y="725" width="0.3" height="15.0" fill="rgb(243,73,42)" rx="2" ry="2" />
+<text  x="34.24" y="735.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (4 samples, 0.03%)</title><rect x="1186.0" y="725" width="0.4" height="15.0" fill="rgb(245,170,40)" rx="2" ry="2" />
+<text  x="1189.02" y="735.5" ></text>
+</g>
+<g >
+<title>hrtimer_cancel (4 samples, 0.03%)</title><rect x="1187.1" y="869" width="0.4" height="15.0" fill="rgb(236,172,44)" rx="2" ry="2" />
+<text  x="1190.12" y="879.5" ></text>
+</g>
+<g >
+<title>JIT_New (2 samples, 0.01%)</title><rect x="1176.3" y="517" width="0.2" height="15.0" fill="rgb(220,87,23)" rx="2" ry="2" />
+<text  x="1179.29" y="527.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (4 samples, 0.03%)</title><rect x="10.0" y="917" width="0.3" height="15.0" fill="rgb(248,72,51)" rx="2" ry="2" />
+<text  x="13.00" y="927.5" ></text>
+</g>
+<g >
+<title>futex_wait (241 samples, 1.73%)</title><rect x="102.5" y="885" width="20.4" height="15.0" fill="rgb(245,109,28)" rx="2" ry="2" />
+<text  x="105.48" y="895.5" ></text>
+</g>
+<g >
+<title>__ip_queue_xmit (4 samples, 0.03%)</title><rect x="19.1" y="757" width="0.3" height="15.0" fill="rgb(222,215,8)" rx="2" ry="2" />
+<text  x="22.05" y="767.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker::InvokeNextResultFilterAsync (23 samples, 0.16%)</title><rect x="1176.7" y="581" width="2.0" height="15.0" fill="rgb(254,90,6)" rx="2" ry="2" />
+<text  x="1179.72" y="591.5" ></text>
+</g>
+<g >
+<title>__seccomp_filter (6 samples, 0.04%)</title><rect x="136.4" y="821" width="0.5" height="15.0" fill="rgb(223,129,4)" rx="2" ry="2" />
+<text  x="139.41" y="831.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (247 samples, 1.77%)</title><rect x="102.0" y="933" width="20.9" height="15.0" fill="rgb(253,109,7)" rx="2" ry="2" />
+<text  x="104.97" y="943.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (6 samples, 0.04%)</title><rect x="140.3" y="213" width="0.5" height="15.0" fill="rgb(247,178,15)" rx="2" ry="2" />
+<text  x="143.30" y="223.5" ></text>
+</g>
+<g >
+<title>object [Anonymously Hosted DynamicMethods Assembly] dynamicClass::lambda_method11 (10 samples, 0.07%)</title><rect x="140.1" y="485" width="0.9" height="15.0" fill="rgb(223,196,39)" rx="2" ry="2" />
+<text  x="143.13" y="495.5" ></text>
+</g>
+<g >
+<title>asm_sysvec_reschedule_ipi (24 samples, 0.17%)</title><rect x="1173.8" y="453" width="2.0" height="15.0" fill="rgb(208,89,41)" rx="2" ry="2" />
+<text  x="1176.75" y="463.5" ></text>
+</g>
+<g >
+<title>update_sd_lb_stats.constprop.0 (3 samples, 0.02%)</title><rect x="95.5" y="757" width="0.2" height="15.0" fill="rgb(214,49,42)" rx="2" ry="2" />
+<text  x="98.46" y="767.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpProtocol::Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature.StartAsync (5 samples, 0.04%)</title><rect x="1177.1" y="469" width="0.5" height="15.0" fill="rgb(236,44,14)" rx="2" ry="2" />
+<text  x="1180.14" y="479.5" ></text>
+</g>
+<g >
+<title>__sysvec_apic_timer_interrupt (7 samples, 0.05%)</title><rect x="1170.2" y="421" width="0.6" height="15.0" fill="rgb(221,168,42)" rx="2" ry="2" />
+<text  x="1173.20" y="431.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (241 samples, 1.73%)</title><rect x="102.5" y="917" width="20.4" height="15.0" fill="rgb(227,206,26)" rx="2" ry="2" />
+<text  x="105.48" y="927.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (233 samples, 1.67%)</title><rect x="103.2" y="837" width="19.7" height="15.0" fill="rgb(213,116,39)" rx="2" ry="2" />
+<text  x="106.16" y="847.5" ></text>
+</g>
+<g >
+<title>futex_wait_queue_me (8 samples, 0.06%)</title><rect x="1187.5" y="869" width="0.6" height="15.0" fill="rgb(228,204,4)" rx="2" ry="2" />
+<text  x="1190.46" y="879.5" ></text>
+</g>
+<g >
+<title>[unknown] (18 samples, 0.13%)</title><rect x="17.1" y="965" width="1.5" height="15.0" fill="rgb(220,211,46)" rx="2" ry="2" />
+<text  x="20.11" y="975.5" ></text>
+</g>
+<g >
+<title>calc_timer_values (16 samples, 0.11%)</title><rect x="14.1" y="645" width="1.4" height="15.0" fill="rgb(243,149,10)" rx="2" ry="2" />
+<text  x="17.15" y="655.5" ></text>
+</g>
+<g >
+<title>instance !1 [System.Collections.Concurrent] System.Collections.Concurrent.ConcurrentDictionary`2[System.__Canon,System.__Canon]::GetOrAdd (2 samples, 0.01%)</title><rect x="1178.4" y="485" width="0.2" height="15.0" fill="rgb(208,228,3)" rx="2" ry="2" />
+<text  x="1181.41" y="495.5" ></text>
+</g>
+<g >
+<title>ip_protocol_deliver_rcu (3 samples, 0.02%)</title><rect x="20.2" y="229" width="0.2" height="15.0" fill="rgb(214,20,27)" rx="2" ry="2" />
+<text  x="23.15" y="239.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalSynchronizationManager::ThreadNativeWait (2 samples, 0.01%)</title><rect x="129.1" y="853" width="0.2" height="15.0" fill="rgb(232,45,32)" rx="2" ry="2" />
+<text  x="132.13" y="863.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (20 samples, 0.14%)</title><rect x="1171.0" y="341" width="1.7" height="15.0" fill="rgb(217,182,16)" rx="2" ry="2" />
+<text  x="1174.05" y="351.5" ></text>
+</g>
+<g >
+<title>event_sched_in.isra.0 (4 samples, 0.03%)</title><rect x="1173.4" y="261" width="0.4" height="15.0" fill="rgb(242,151,51)" rx="2" ry="2" />
+<text  x="1176.42" y="271.5" ></text>
+</g>
+<g >
+<title>do_futex (882 samples, 6.32%)</title><rect x="27.2" y="901" width="74.6" height="15.0" fill="rgb(208,11,33)" rx="2" ry="2" />
+<text  x="30.18" y="911.5" >do_futex</text>
+</g>
+<g >
+<title>syscall_trace_enter (4 samples, 0.03%)</title><rect x="21.0" y="917" width="0.3" height="15.0" fill="rgb(230,106,23)" rx="2" ry="2" />
+<text  x="24.00" y="927.5" ></text>
+</g>
+<g >
+<title>[unknown] (72 samples, 0.52%)</title><rect x="10.3" y="965" width="6.1" height="15.0" fill="rgb(223,208,19)" rx="2" ry="2" />
+<text  x="13.34" y="975.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4 samples, 0.03%)</title><rect x="10.0" y="949" width="0.3" height="15.0" fill="rgb(230,38,51)" rx="2" ry="2" />
+<text  x="13.00" y="959.5" ></text>
+</g>
+<g >
+<title>ThreadPoolNative::RequestWorkerThread (4 samples, 0.03%)</title><rect x="16.7" y="757" width="0.3" height="15.0" fill="rgb(207,62,19)" rx="2" ry="2" />
+<text  x="19.68" y="767.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Routing.ActionEndpointFactory+&lt;&gt;c__DisplayClass7_0::&lt;CreateRequestDelegate&gt;b__0 (12,282 samples, 88.07%)</title><rect x="139.6" y="677" width="1039.2" height="15.0" fill="rgb(211,128,2)" rx="2" ry="2" />
+<text  x="142.63" y="687.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Routing.ActionEndpointFactor..</text>
+</g>
+<g >
+<title>start_thread (5 samples, 0.04%)</title><rect x="16.7" y="965" width="0.4" height="15.0" fill="rgb(242,132,8)" rx="2" ry="2" />
+<text  x="19.68" y="975.5" ></text>
+</g>
+<g >
+<title>.NET_ThreadPool (13,763 samples, 98.69%)</title><rect x="17.1" y="981" width="1164.5" height="15.0" fill="rgb(226,187,22)" rx="2" ry="2" />
+<text  x="20.11" y="991.5" >.NET_ThreadPool</text>
+</g>
+<g >
+<title>hrtimer_try_to_cancel (57 samples, 0.41%)</title><rect x="97.0" y="853" width="4.8" height="15.0" fill="rgb(207,107,36)" rx="2" ry="2" />
+<text  x="99.98" y="863.5" ></text>
+</g>
+<g >
+<title>__tcp_transmit_skb (6 samples, 0.04%)</title><rect x="19.9" y="773" width="0.5" height="15.0" fill="rgb(242,122,29)" rx="2" ry="2" />
+<text  x="22.90" y="783.5" ></text>
+</g>
+<g >
+<title>tcp_write_xmit (7 samples, 0.05%)</title><rect x="19.8" y="789" width="0.6" height="15.0" fill="rgb(245,8,0)" rx="2" ry="2" />
+<text  x="22.82" y="799.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="17.1" y="933" width="0.2" height="15.0" fill="rgb(229,61,10)" rx="2" ry="2" />
+<text  x="20.11" y="943.5" ></text>
+</g>
+<g >
+<title>ctx_sched_out (2 samples, 0.01%)</title><rect x="103.2" y="789" width="0.1" height="15.0" fill="rgb(231,159,15)" rx="2" ry="2" />
+<text  x="106.16" y="799.5" ></text>
+</g>
+<g >
+<title>perf_pmu_disable.part.0 (2 samples, 0.01%)</title><rect x="103.2" y="773" width="0.1" height="15.0" fill="rgb(229,51,17)" rx="2" ry="2" />
+<text  x="106.16" y="783.5" ></text>
+</g>
+<g >
+<title>instance string [webapi] webapi.Controllers.WeatherForecastController::OffCPU (10 samples, 0.07%)</title><rect x="140.1" y="469" width="0.9" height="15.0" fill="rgb(222,39,16)" rx="2" ry="2" />
+<text  x="143.13" y="479.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1+AsyncStateMachineBox`1[System.Threading.Tasks.VoidTaskResult,Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpProtocol+&lt;ProcessRequests&gt;d__223`1[System.__Canon]]::MoveNext (12,305 samples, 88.23%)</title><rect x="138.8" y="805" width="1041.1" height="15.0" fill="rgb(237,73,39)" rx="2" ry="2" />
+<text  x="141.78" y="815.5" >instance void [System.Private.CoreLib] System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1+AsyncStateMachineBox`1[System.Threading.Tasks.Voi..</text>
+</g>
+<g >
+<title>asm_call_sysvec_on_stack (3 samples, 0.02%)</title><rect x="19.1" y="613" width="0.2" height="15.0" fill="rgb(212,186,31)" rx="2" ry="2" />
+<text  x="22.05" y="623.5" ></text>
+</g>
+<g >
+<title>ThreadNative::SpinWait (2 samples, 0.01%)</title><rect x="140.8" y="373" width="0.2" height="15.0" fill="rgb(233,133,25)" rx="2" ry="2" />
+<text  x="143.81" y="383.5" ></text>
+</g>
+<g >
+<title>event_sched_in.isra.0 (4 samples, 0.03%)</title><rect x="1187.8" y="725" width="0.3" height="15.0" fill="rgb(209,205,32)" rx="2" ry="2" />
+<text  x="1190.80" y="735.5" ></text>
+</g>
+<g >
+<title>instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;valuetype [System.IO.Pipelines]System.IO.Pipelines.FlushResult&gt; [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure.PipeWriterHelpers.TimingPipeFlusher::FlushAsync (3 samples, 0.02%)</title><rect x="1177.6" y="421" width="0.2" height="15.0" fill="rgb(235,160,37)" rx="2" ry="2" />
+<text  x="1180.56" y="431.5" ></text>
+</g>
+<g >
+<title>AllocateObject (2 samples, 0.01%)</title><rect x="1176.3" y="501" width="0.2" height="15.0" fill="rgb(237,181,50)" rx="2" ry="2" />
+<text  x="1179.29" y="511.5" ></text>
+</g>
+<g >
+<title>void [System.Private.CoreLib] System.Threading.ExecutionContext::RunInternal (3 samples, 0.02%)</title><rect x="138.0" y="773" width="0.3" height="15.0" fill="rgb(216,61,46)" rx="2" ry="2" />
+<text  x="141.02" y="783.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker::Next (12,247 samples, 87.82%)</title><rect x="140.0" y="565" width="1036.3" height="15.0" fill="rgb(237,100,44)" rx="2" ry="2" />
+<text  x="143.05" y="575.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerAct..</text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (13 samples, 0.09%)</title><rect x="19.5" y="949" width="1.1" height="15.0" fill="rgb(217,144,13)" rx="2" ry="2" />
+<text  x="22.48" y="959.5" ></text>
+</g>
+<g >
+<title>amd_pmu_disable_all (2 samples, 0.01%)</title><rect x="133.1" y="709" width="0.2" height="15.0" fill="rgb(205,229,0)" rx="2" ry="2" />
+<text  x="136.11" y="719.5" ></text>
+</g>
+<g >
+<title>do_futex (13 samples, 0.09%)</title><rect x="22.0" y="901" width="1.1" height="15.0" fill="rgb(227,84,17)" rx="2" ry="2" />
+<text  x="25.01" y="911.5" ></text>
+</g>
+<g >
+<title>x86_pmu_disable_all (2 samples, 0.01%)</title><rect x="31.7" y="725" width="0.2" height="15.0" fill="rgb(207,60,53)" rx="2" ry="2" />
+<text  x="34.75" y="735.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (13 samples, 0.09%)</title><rect x="22.0" y="917" width="1.1" height="15.0" fill="rgb(223,80,15)" rx="2" ry="2" />
+<text  x="25.01" y="927.5" ></text>
+</g>
+<g >
+<title>hrtimer_active (4 samples, 0.03%)</title><rect x="100.8" y="837" width="0.3" height="15.0" fill="rgb(213,25,6)" rx="2" ry="2" />
+<text  x="103.79" y="847.5" ></text>
+</g>
+<g >
+<title>ctx_sched_out (12 samples, 0.09%)</title><rect x="31.0" y="789" width="1.0" height="15.0" fill="rgb(213,161,8)" rx="2" ry="2" />
+<text  x="33.98" y="799.5" ></text>
+</g>
+<g >
+<title>syscall_trace_enter (6 samples, 0.04%)</title><rect x="129.9" y="805" width="0.5" height="15.0" fill="rgb(244,197,5)" rx="2" ry="2" />
+<text  x="132.90" y="815.5" ></text>
+</g>
+<g >
+<title>instance class Microsoft.AspNetCore.Hosting.HostingApplication/Context [Microsoft.AspNetCore.Hosting] Microsoft.AspNetCore.Hosting.HostingApplication::CreateContext (3 samples, 0.02%)</title><rect x="139.2" y="757" width="0.3" height="15.0" fill="rgb(226,66,27)" rx="2" ry="2" />
+<text  x="142.20" y="767.5" ></text>
+</g>
+<g >
+<title>tcp_sendmsg (10 samples, 0.07%)</title><rect x="19.6" y="853" width="0.8" height="15.0" fill="rgb(254,10,54)" rx="2" ry="2" />
+<text  x="22.56" y="863.5" ></text>
+</g>
+<g >
+<title>__x64_sys_sched_yield (2 samples, 0.01%)</title><rect x="131.8" y="869" width="0.2" height="15.0" fill="rgb(247,218,3)" rx="2" ry="2" />
+<text  x="134.84" y="879.5" ></text>
+</g>
+<g >
+<title>hrtimer_cancel (61 samples, 0.44%)</title><rect x="96.6" y="869" width="5.2" height="15.0" fill="rgb(235,172,6)" rx="2" ry="2" />
+<text  x="99.64" y="879.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (8 samples, 0.06%)</title><rect x="1174.4" y="325" width="0.7" height="15.0" fill="rgb(241,191,52)" rx="2" ry="2" />
+<text  x="1177.43" y="335.5" ></text>
+</g>
+<g >
+<title>__tcp_send_ack.part.0 (4 samples, 0.03%)</title><rect x="19.1" y="805" width="0.3" height="15.0" fill="rgb(209,163,15)" rx="2" ry="2" />
+<text  x="22.05" y="815.5" ></text>
+</g>
+<g >
+<title>start_thread (2 samples, 0.01%)</title><rect x="1189.8" y="965" width="0.2" height="15.0" fill="rgb(226,162,16)" rx="2" ry="2" />
+<text  x="1192.83" y="975.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.ThreadPoolWorkQueue::EnsureThreadRequested (4 samples, 0.03%)</title><rect x="16.7" y="773" width="0.3" height="15.0" fill="rgb(206,186,35)" rx="2" ry="2" />
+<text  x="19.68" y="783.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalThread::ThreadEntry (5 samples, 0.04%)</title><rect x="16.7" y="949" width="0.4" height="15.0" fill="rgb(217,93,24)" rx="2" ry="2" />
+<text  x="19.68" y="959.5" ></text>
+</g>
+<g >
+<title>do_epoll_wait (70 samples, 0.50%)</title><rect x="10.5" y="885" width="5.9" height="15.0" fill="rgb(206,184,25)" rx="2" ry="2" />
+<text  x="13.51" y="895.5" ></text>
+</g>
+<g >
+<title>__ip_finish_output (4 samples, 0.03%)</title><rect x="20.1" y="677" width="0.3" height="15.0" fill="rgb(253,199,48)" rx="2" ry="2" />
+<text  x="23.07" y="687.5" ></text>
+</g>
+<g >
+<title>getrusage (3 samples, 0.02%)</title><rect x="123.1" y="917" width="0.3" height="15.0" fill="rgb(235,106,11)" rx="2" ry="2" />
+<text  x="126.13" y="927.5" ></text>
+</g>
+<g >
+<title>flush_smp_call_function_queue (4 samples, 0.03%)</title><rect x="1181.1" y="405" width="0.4" height="15.0" fill="rgb(240,42,13)" rx="2" ry="2" />
+<text  x="1184.12" y="415.5" ></text>
+</g>
+<g >
+<title>new_sync_read (4 samples, 0.03%)</title><rect x="18.1" y="853" width="0.4" height="15.0" fill="rgb(253,73,31)" rx="2" ry="2" />
+<text  x="21.12" y="863.5" ></text>
+</g>
+<g >
+<title>sched_clock_cpu (5 samples, 0.04%)</title><rect x="135.4" y="773" width="0.4" height="15.0" fill="rgb(222,118,53)" rx="2" ry="2" />
+<text  x="138.40" y="783.5" ></text>
+</g>
+<g >
+<title>pick_next_task_fair (15 samples, 0.11%)</title><rect x="94.7" y="821" width="1.3" height="15.0" fill="rgb(253,162,26)" rx="2" ry="2" />
+<text  x="97.70" y="831.5" ></text>
+</g>
+<g >
+<title>tick_sched_timer (5 samples, 0.04%)</title><rect x="1170.3" y="373" width="0.4" height="15.0" fill="rgb(249,48,22)" rx="2" ry="2" />
+<text  x="1173.29" y="383.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Http] Microsoft.AspNetCore.Http.DefaultHttpResponse::StartAsync (6 samples, 0.04%)</title><rect x="1177.1" y="485" width="0.5" height="15.0" fill="rgb(246,144,44)" rx="2" ry="2" />
+<text  x="1180.05" y="495.5" ></text>
+</g>
+<g >
+<title>task_ctx_sched_out (12 samples, 0.09%)</title><rect x="31.0" y="805" width="1.0" height="15.0" fill="rgb(208,136,18)" rx="2" ry="2" />
+<text  x="33.98" y="815.5" ></text>
+</g>
+<g >
+<title>__sysvec_apic_timer_interrupt (5 samples, 0.04%)</title><rect x="94.3" y="757" width="0.4" height="15.0" fill="rgb(246,27,50)" rx="2" ry="2" />
+<text  x="97.27" y="767.5" ></text>
+</g>
+<g >
+<title>__ip_queue_xmit (5 samples, 0.04%)</title><rect x="20.0" y="741" width="0.4" height="15.0" fill="rgb(223,50,30)" rx="2" ry="2" />
+<text  x="22.98" y="751.5" ></text>
+</g>
+<g >
+<title>native_write_msr (3 samples, 0.02%)</title><rect x="31.5" y="725" width="0.2" height="15.0" fill="rgb(230,130,35)" rx="2" ry="2" />
+<text  x="34.49" y="735.5" ></text>
+</g>
+<g >
+<title>schedule_hrtimeout_range_clock (69 samples, 0.49%)</title><rect x="10.6" y="837" width="5.8" height="15.0" fill="rgb(240,113,47)" rx="2" ry="2" />
+<text  x="13.59" y="847.5" ></text>
+</g>
+<g >
+<title>pick_next_task_idle (3 samples, 0.02%)</title><rect x="96.0" y="821" width="0.2" height="15.0" fill="rgb(242,134,33)" rx="2" ry="2" />
+<text  x="98.97" y="831.5" ></text>
+</g>
+<g >
+<title>arch_perf_update_userpage (4 samples, 0.03%)</title><rect x="89.9" y="677" width="0.3" height="15.0" fill="rgb(225,174,50)" rx="2" ry="2" />
+<text  x="92.87" y="687.5" ></text>
+</g>
+<g >
+<title>__syscall_return_slowpath (15 samples, 0.11%)</title><rect x="25.5" y="917" width="1.3" height="15.0" fill="rgb(215,164,28)" rx="2" ry="2" />
+<text  x="28.48" y="927.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (48 samples, 0.34%)</title><rect x="1182.6" y="821" width="4.1" height="15.0" fill="rgb(230,2,52)" rx="2" ry="2" />
+<text  x="1185.64" y="831.5" ></text>
+</g>
+<g >
+<title>QueueUserWorkItemManagedCallback (12,326 samples, 88.38%)</title><rect x="137.4" y="869" width="1043.0" height="15.0" fill="rgb(221,209,34)" rx="2" ry="2" />
+<text  x="140.43" y="879.5" >QueueUserWorkItemManagedCallback</text>
+</g>
+<g >
+<title>__x64_sys_futex (5 samples, 0.04%)</title><rect x="1181.7" y="917" width="0.4" height="15.0" fill="rgb(206,59,24)" rx="2" ry="2" />
+<text  x="1184.71" y="927.5" ></text>
+</g>
+<g >
+<title>CLREventBase::WaitEx (7 samples, 0.05%)</title><rect x="140.2" y="341" width="0.6" height="15.0" fill="rgb(214,93,33)" rx="2" ry="2" />
+<text  x="143.22" y="351.5" ></text>
+</g>
+<g >
+<title>generic_smp_call_function_single_interrupt (4 samples, 0.03%)</title><rect x="1181.1" y="421" width="0.4" height="15.0" fill="rgb(208,214,1)" rx="2" ry="2" />
+<text  x="1184.12" y="431.5" ></text>
+</g>
+<g >
+<title>pthread_cond_timedwait@@GLIBC_2.3.2 (931 samples, 6.68%)</title><rect x="23.2" y="965" width="78.8" height="15.0" fill="rgb(221,118,28)" rx="2" ry="2" />
+<text  x="26.20" y="975.5" >pthread_c..</text>
+</g>
+<g >
+<title>CallDescrWorkerInternal (5 samples, 0.04%)</title><rect x="16.7" y="853" width="0.4" height="15.0" fill="rgb(254,168,25)" rx="2" ry="2" />
+<text  x="19.68" y="863.5" ></text>
+</g>
+<g >
+<title>__lll_unlock_wake (4 samples, 0.03%)</title><rect x="1181.1" y="613" width="0.4" height="15.0" fill="rgb(221,2,50)" rx="2" ry="2" />
+<text  x="1184.12" y="623.5" ></text>
+</g>
+<g >
+<title>try_to_wake_up (10 samples, 0.07%)</title><rect x="22.2" y="853" width="0.8" height="15.0" fill="rgb(239,93,25)" rx="2" ry="2" />
+<text  x="25.18" y="863.5" ></text>
+</g>
+<g >
+<title>__x64_sys_epoll_wait (70 samples, 0.50%)</title><rect x="10.5" y="901" width="5.9" height="15.0" fill="rgb(236,185,6)" rx="2" ry="2" />
+<text  x="13.51" y="911.5" ></text>
+</g>
+<g >
+<title>__prepare_exit_to_usermode (4 samples, 0.03%)</title><rect x="17.8" y="885" width="0.3" height="15.0" fill="rgb(253,172,7)" rx="2" ry="2" />
+<text  x="20.78" y="895.5" ></text>
+</g>
+<g >
+<title>pipe_read (4 samples, 0.03%)</title><rect x="18.1" y="837" width="0.4" height="15.0" fill="rgb(250,80,20)" rx="2" ry="2" />
+<text  x="21.12" y="847.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (60 samples, 0.43%)</title><rect x="132.0" y="869" width="5.1" height="15.0" fill="rgb(228,184,43)" rx="2" ry="2" />
+<text  x="135.01" y="879.5" ></text>
+</g>
+<g >
+<title>futex_wait_queue_me (4 samples, 0.03%)</title><rect x="10.0" y="869" width="0.3" height="15.0" fill="rgb(212,224,26)" rx="2" ry="2" />
+<text  x="13.00" y="879.5" ></text>
+</g>
+<g >
+<title>sysvec_call_function_single (4 samples, 0.03%)</title><rect x="1181.1" y="469" width="0.4" height="15.0" fill="rgb(230,41,3)" rx="2" ry="2" />
+<text  x="1184.12" y="479.5" ></text>
+</g>
+<g >
+<title>ksys_read (5 samples, 0.04%)</title><rect x="18.1" y="885" width="0.4" height="15.0" fill="rgb(249,149,20)" rx="2" ry="2" />
+<text  x="21.12" y="895.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (216 samples, 1.55%)</title><rect x="104.6" y="789" width="18.3" height="15.0" fill="rgb(247,68,26)" rx="2" ry="2" />
+<text  x="107.60" y="799.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (887 samples, 6.36%)</title><rect x="26.8" y="917" width="75.0" height="15.0" fill="rgb(222,90,32)" rx="2" ry="2" />
+<text  x="29.75" y="927.5" >__x64_sy..</text>
+</g>
+<g >
+<title>__sched_text_start (8 samples, 0.06%)</title><rect x="1187.5" y="837" width="0.6" height="15.0" fill="rgb(212,46,15)" rx="2" ry="2" />
+<text  x="1190.46" y="847.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpProtocol::WriteSuffix (3 samples, 0.02%)</title><rect x="1179.2" y="757" width="0.2" height="15.0" fill="rgb(244,40,6)" rx="2" ry="2" />
+<text  x="1182.17" y="767.5" ></text>
+</g>
+<g >
+<title>__sched_yield (73 samples, 0.52%)</title><rect x="131.2" y="901" width="6.1" height="15.0" fill="rgb(254,166,31)" rx="2" ry="2" />
+<text  x="134.16" y="911.5" ></text>
+</g>
+<g >
+<title>ThreadpoolMgr::GateThreadStart (5 samples, 0.04%)</title><rect x="123.0" y="933" width="0.4" height="15.0" fill="rgb(208,4,17)" rx="2" ry="2" />
+<text  x="125.96" y="943.5" ></text>
+</g>
+<g >
+<title>__condvar_dec_grefs (2 samples, 0.01%)</title><rect x="18.6" y="965" width="0.2" height="15.0" fill="rgb(239,92,12)" rx="2" ry="2" />
+<text  x="21.63" y="975.5" ></text>
+</g>
+<g >
+<title>ManagedThreadBase_DispatchOuter (7 samples, 0.05%)</title><rect x="1181.0" y="853" width="0.6" height="15.0" fill="rgb(207,57,47)" rx="2" ry="2" />
+<text  x="1184.03" y="863.5" ></text>
+</g>
+<g >
+<title>do_futex (16 samples, 0.11%)</title><rect x="1188.5" y="901" width="1.3" height="15.0" fill="rgb(226,215,33)" rx="2" ry="2" />
+<text  x="1191.48" y="911.5" ></text>
+</g>
+<g >
+<title>instance bool [System.Private.CoreLib] System.Threading.Tasks.Task::InternalWaitCore (10 samples, 0.07%)</title><rect x="140.1" y="437" width="0.9" height="15.0" fill="rgb(248,96,48)" rx="2" ry="2" />
+<text  x="143.13" y="447.5" ></text>
+</g>
+<g >
+<title>__local_bh_enable_ip (4 samples, 0.03%)</title><rect x="20.1" y="645" width="0.3" height="15.0" fill="rgb(251,56,45)" rx="2" ry="2" />
+<text  x="23.07" y="655.5" ></text>
+</g>
+<g >
+<title>ManagedThreadBase::KickOff (2 samples, 0.01%)</title><rect x="1189.8" y="917" width="0.2" height="15.0" fill="rgb(213,104,50)" rx="2" ry="2" />
+<text  x="1192.83" y="927.5" ></text>
+</g>
+<g >
+<title>__wake_up_common (3 samples, 0.02%)</title><rect x="20.2" y="101" width="0.2" height="15.0" fill="rgb(240,1,24)" rx="2" ry="2" />
+<text  x="23.15" y="111.5" ></text>
+</g>
+<g >
+<title>perf_pmu_disable.part.0 (2 samples, 0.01%)</title><rect x="133.1" y="741" width="0.2" height="15.0" fill="rgb(241,93,18)" rx="2" ry="2" />
+<text  x="136.11" y="751.5" ></text>
+</g>
+<g >
+<title>thread_group_cputime_adjusted (3 samples, 0.02%)</title><rect x="123.1" y="821" width="0.3" height="15.0" fill="rgb(224,103,50)" rx="2" ry="2" />
+<text  x="126.13" y="831.5" ></text>
+</g>
+<g >
+<title>do_futex (5 samples, 0.04%)</title><rect x="1181.7" y="901" width="0.4" height="15.0" fill="rgb(239,103,22)" rx="2" ry="2" />
+<text  x="1184.71" y="911.5" ></text>
+</g>
+<g >
+<title>tcp_sendmsg_locked (10 samples, 0.07%)</title><rect x="19.6" y="837" width="0.8" height="15.0" fill="rgb(253,31,23)" rx="2" ry="2" />
+<text  x="22.56" y="847.5" ></text>
+</g>
+<g >
+<title>SVR::GCHeap::Alloc (2 samples, 0.01%)</title><rect x="1176.3" y="485" width="0.2" height="15.0" fill="rgb(232,77,9)" rx="2" ry="2" />
+<text  x="1179.29" y="495.5" ></text>
+</g>
+<g >
+<title>__seccomp_filter (5 samples, 0.04%)</title><rect x="140.4" y="165" width="0.4" height="15.0" fill="rgb(249,183,0)" rx="2" ry="2" />
+<text  x="143.39" y="175.5" ></text>
+</g>
+<g >
+<title>bool [System.Private.CoreLib] System.Threading.ThreadPool::UnsafeQueueUserWorkItem (4 samples, 0.03%)</title><rect x="16.7" y="805" width="0.3" height="15.0" fill="rgb(225,84,49)" rx="2" ry="2" />
+<text  x="19.68" y="815.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets] Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal.IOQueue::System.Threading.IThreadPoolWorkItem.Execute (3 samples, 0.02%)</title><rect x="138.0" y="805" width="0.3" height="15.0" fill="rgb(229,123,28)" rx="2" ry="2" />
+<text  x="141.02" y="815.5" ></text>
+</g>
+<g >
+<title>!!0 [Microsoft.Extensions.DependencyInjection.Abstractions] Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions::GetRequiredService (2 samples, 0.01%)</title><rect x="1178.4" y="533" width="0.2" height="15.0" fill="rgb(247,71,49)" rx="2" ry="2" />
+<text  x="1181.41" y="543.5" ></text>
+</g>
+<g >
+<title>rb_next (16 samples, 0.11%)</title><rect x="115.1" y="757" width="1.3" height="15.0" fill="rgb(206,130,26)" rx="2" ry="2" />
+<text  x="118.09" y="767.5" ></text>
+</g>
+<g >
+<title>ip_finish_output (4 samples, 0.03%)</title><rect x="20.1" y="693" width="0.3" height="15.0" fill="rgb(212,196,31)" rx="2" ry="2" />
+<text  x="23.07" y="703.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpResponseHeaders::CopyToFast (3 samples, 0.02%)</title><rect x="1177.2" y="389" width="0.3" height="15.0" fill="rgb(206,137,25)" rx="2" ry="2" />
+<text  x="1180.22" y="399.5" ></text>
+</g>
+<g >
+<title>update_nohz_stats (2 samples, 0.01%)</title><rect x="95.3" y="757" width="0.2" height="15.0" fill="rgb(248,183,1)" rx="2" ry="2" />
+<text  x="98.29" y="767.5" ></text>
+</g>
+<g >
+<title>instance object [System.Private.CoreLib] System.Threading.ThreadPoolWorkQueue::Dequeue (5 samples, 0.04%)</title><rect x="137.6" y="805" width="0.4" height="15.0" fill="rgb(233,52,25)" rx="2" ry="2" />
+<text  x="140.60" y="815.5" ></text>
+</g>
+<g >
+<title>ObjectNative::PulseAll (2 samples, 0.01%)</title><rect x="1181.5" y="677" width="0.1" height="15.0" fill="rgb(227,79,10)" rx="2" ry="2" />
+<text  x="1184.45" y="687.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker::ResultNext (25 samples, 0.18%)</title><rect x="1176.5" y="597" width="2.2" height="15.0" fill="rgb(222,203,45)" rx="2" ry="2" />
+<text  x="1179.55" y="607.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (909 samples, 6.52%)</title><rect x="25.1" y="933" width="76.9" height="15.0" fill="rgb(211,42,18)" rx="2" ry="2" />
+<text  x="28.06" y="943.5" >do_sysca..</text>
+</g>
+<g >
+<title>perf_event_sched_in (20 samples, 0.14%)</title><rect x="1171.0" y="309" width="1.7" height="15.0" fill="rgb(251,135,45)" rx="2" ry="2" />
+<text  x="1174.05" y="319.5" ></text>
+</g>
+<g >
+<title>WaitForMultipleObjectsEx (6 samples, 0.04%)</title><rect x="140.3" y="293" width="0.5" height="15.0" fill="rgb(254,150,1)" rx="2" ry="2" />
+<text  x="143.30" y="303.5" ></text>
+</g>
+<g >
+<title>ObjectNative::WaitTimeout (8 samples, 0.06%)</title><rect x="140.1" y="389" width="0.7" height="15.0" fill="rgb(208,117,4)" rx="2" ry="2" />
+<text  x="143.13" y="399.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (40 samples, 0.29%)</title><rect x="1183.3" y="789" width="3.4" height="15.0" fill="rgb(239,220,12)" rx="2" ry="2" />
+<text  x="1186.32" y="799.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (4 samples, 0.03%)</title><rect x="1181.1" y="517" width="0.4" height="15.0" fill="rgb(222,18,48)" rx="2" ry="2" />
+<text  x="1184.12" y="527.5" ></text>
+</g>
+<g >
+<title>CallDescrWorkerInternal (2 samples, 0.01%)</title><rect x="1189.8" y="853" width="0.2" height="15.0" fill="rgb(224,46,31)" rx="2" ry="2" />
+<text  x="1192.83" y="863.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (8 samples, 0.06%)</title><rect x="1187.5" y="917" width="0.6" height="15.0" fill="rgb(216,194,47)" rx="2" ry="2" />
+<text  x="1190.46" y="927.5" ></text>
+</g>
+<g >
+<title>_raw_spin_lock_irqsave (4 samples, 0.03%)</title><rect x="95.0" y="773" width="0.3" height="15.0" fill="rgb(225,121,24)" rx="2" ry="2" />
+<text  x="97.95" y="783.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (12 samples, 0.09%)</title><rect x="1171.0" y="277" width="1.1" height="15.0" fill="rgb(245,147,47)" rx="2" ry="2" />
+<text  x="1174.05" y="287.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.TimerQueueTimer::CallCallback (7 samples, 0.05%)</title><rect x="1181.0" y="757" width="0.6" height="15.0" fill="rgb(239,49,32)" rx="2" ry="2" />
+<text  x="1184.03" y="767.5" ></text>
+</g>
+<g >
+<title>ManagedThreadBase::ThreadPool (7 samples, 0.05%)</title><rect x="1181.0" y="869" width="0.6" height="15.0" fill="rgb(206,191,11)" rx="2" ry="2" />
+<text  x="1184.03" y="879.5" ></text>
+</g>
+<g >
+<title>__x64_sys_recvfrom (6 samples, 0.04%)</title><rect x="18.9" y="917" width="0.5" height="15.0" fill="rgb(232,178,23)" rx="2" ry="2" />
+<text  x="21.88" y="927.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (4 samples, 0.03%)</title><rect x="104.3" y="789" width="0.3" height="15.0" fill="rgb(213,16,18)" rx="2" ry="2" />
+<text  x="107.26" y="799.5" ></text>
+</g>
+<g >
+<title>read_tsc (4 samples, 0.03%)</title><rect x="94.4" y="725" width="0.3" height="15.0" fill="rgb(247,171,38)" rx="2" ry="2" />
+<text  x="97.36" y="735.5" ></text>
+</g>
+<g >
+<title>MethodDescCallSite::CallTargetWorker (12,325 samples, 88.38%)</title><rect x="137.4" y="853" width="1042.9" height="15.0" fill="rgb(225,32,42)" rx="2" ry="2" />
+<text  x="140.43" y="863.5" >MethodDescCallSite::CallTargetWorker</text>
+</g>
+<g >
+<title>_find_next_bit.constprop.0 (2 samples, 0.01%)</title><rect x="95.5" y="725" width="0.2" height="15.0" fill="rgb(218,225,9)" rx="2" ry="2" />
+<text  x="98.54" y="735.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (5 samples, 0.04%)</title><rect x="20.9" y="949" width="0.4" height="15.0" fill="rgb(216,108,32)" rx="2" ry="2" />
+<text  x="23.91" y="959.5" ></text>
+</g>
+<g >
+<title>ttwu_do_activate (2 samples, 0.01%)</title><rect x="1181.9" y="837" width="0.1" height="15.0" fill="rgb(212,34,20)" rx="2" ry="2" />
+<text  x="1184.88" y="847.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (16 samples, 0.11%)</title><rect x="1188.5" y="837" width="1.3" height="15.0" fill="rgb(244,17,47)" rx="2" ry="2" />
+<text  x="1191.48" y="847.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (4 samples, 0.03%)</title><rect x="10.0" y="773" width="0.3" height="15.0" fill="rgb(229,9,51)" rx="2" ry="2" />
+<text  x="13.00" y="783.5" ></text>
+</g>
+<g >
+<title>__sys_sendto (11 samples, 0.08%)</title><rect x="19.5" y="901" width="0.9" height="15.0" fill="rgb(233,102,48)" rx="2" ry="2" />
+<text  x="22.48" y="911.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalThread::ThreadEntry (12,513 samples, 89.72%)</title><rect x="122.9" y="949" width="1058.7" height="15.0" fill="rgb(213,55,23)" rx="2" ry="2" />
+<text  x="125.87" y="959.5" >CorUnix::CPalThread::ThreadEntry</text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.HostFiltering] Microsoft.AspNetCore.HostFiltering.HostFilteringMiddleware::Invoke (12,288 samples, 88.11%)</title><rect x="139.5" y="757" width="1039.7" height="15.0" fill="rgb(245,193,26)" rx="2" ry="2" />
+<text  x="142.46" y="767.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.HostFiltering] Microsoft.AspNetCore.HostFiltering.HostFiltering..</text>
+</g>
+<g >
+<title>instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;class [Microsoft.AspNetCore.Mvc.Abstractions]Microsoft.AspNetCore.Mvc.IActionResult&gt; [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ActionMethodExecutor+SyncObjectResultExecutor::Execute (12,246 samples, 87.81%)</title><rect x="140.0" y="501" width="1036.2" height="15.0" fill="rgb(233,218,17)" rx="2" ry="2" />
+<text  x="143.05" y="511.5" >instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;class [Microsoft.AspNetCore.Mvc.Abstractions]Microsoft.AspNetCore.Mvc.IAct..</text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure.Heartbeat::TimerLoop (2 samples, 0.01%)</title><rect x="1189.8" y="789" width="0.2" height="15.0" fill="rgb(252,154,44)" rx="2" ry="2" />
+<text  x="1192.83" y="799.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (23 samples, 0.16%)</title><rect x="1170.8" y="357" width="1.9" height="15.0" fill="rgb(205,171,24)" rx="2" ry="2" />
+<text  x="1173.79" y="367.5" ></text>
+</g>
+<g >
+<title>sysvec_reschedule_ipi (24 samples, 0.17%)</title><rect x="1173.8" y="437" width="2.0" height="15.0" fill="rgb(228,3,6)" rx="2" ry="2" />
+<text  x="1176.75" y="447.5" ></text>
+</g>
+<g >
+<title>SVR::gc_heap::a_fit_segment_end_p (2 samples, 0.01%)</title><rect x="1176.3" y="421" width="0.2" height="15.0" fill="rgb(232,213,28)" rx="2" ry="2" />
+<text  x="1179.29" y="431.5" ></text>
+</g>
+<g >
+<title>enqueue_task_fair (3 samples, 0.02%)</title><rect x="22.5" y="821" width="0.3" height="15.0" fill="rgb(244,27,7)" rx="2" ry="2" />
+<text  x="25.52" y="831.5" ></text>
+</g>
+<g >
+<title>do_futex (2 samples, 0.01%)</title><rect x="129.6" y="789" width="0.2" height="15.0" fill="rgb(212,106,7)" rx="2" ry="2" />
+<text  x="132.64" y="799.5" ></text>
+</g>
+<g >
+<title>__prepare_exit_to_usermode (14 samples, 0.10%)</title><rect x="25.5" y="901" width="1.2" height="15.0" fill="rgb(251,90,40)" rx="2" ry="2" />
+<text  x="28.48" y="911.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (124 samples, 0.89%)</title><rect x="104.6" y="757" width="10.5" height="15.0" fill="rgb(239,95,35)" rx="2" ry="2" />
+<text  x="107.60" y="767.5" ></text>
+</g>
+<g >
+<title>update_blocked_averages (2 samples, 0.01%)</title><rect x="95.7" y="789" width="0.2" height="15.0" fill="rgb(205,109,45)" rx="2" ry="2" />
+<text  x="98.71" y="799.5" ></text>
+</g>
+<g >
+<title>urandom_read (2 samples, 0.01%)</title><rect x="139.3" y="565" width="0.2" height="15.0" fill="rgb(220,192,51)" rx="2" ry="2" />
+<text  x="142.29" y="575.5" ></text>
+</g>
+<g >
+<title>CorUnix::InternalReleaseSemaphore (2 samples, 0.01%)</title><rect x="16.9" y="677" width="0.1" height="15.0" fill="rgb(218,31,10)" rx="2" ry="2" />
+<text  x="19.85" y="687.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (24 samples, 0.17%)</title><rect x="1183.3" y="757" width="2.0" height="15.0" fill="rgb(232,31,39)" rx="2" ry="2" />
+<text  x="1186.32" y="767.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2 samples, 0.01%)</title><rect x="139.3" y="645" width="0.2" height="15.0" fill="rgb(215,227,31)" rx="2" ry="2" />
+<text  x="142.29" y="655.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (14 samples, 0.10%)</title><rect x="22.0" y="949" width="1.2" height="15.0" fill="rgb(254,183,9)" rx="2" ry="2" />
+<text  x="25.01" y="959.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge.constprop.0 (4 samples, 0.03%)</title><rect x="1187.8" y="757" width="0.3" height="15.0" fill="rgb(244,18,1)" rx="2" ry="2" />
+<text  x="1190.80" y="767.5" ></text>
+</g>
+<g >
+<title>__prepare_exit_to_usermode (4 samples, 0.03%)</title><rect x="1181.1" y="549" width="0.4" height="15.0" fill="rgb(223,219,27)" rx="2" ry="2" />
+<text  x="1184.12" y="559.5" ></text>
+</g>
+<g >
+<title>__syscall_return_slowpath (4 samples, 0.03%)</title><rect x="17.8" y="901" width="0.3" height="15.0" fill="rgb(231,229,18)" rx="2" ry="2" />
+<text  x="20.78" y="911.5" ></text>
+</g>
+<g >
+<title>recalc_sigpending_tsk (4 samples, 0.03%)</title><rect x="17.4" y="869" width="0.4" height="15.0" fill="rgb(206,215,7)" rx="2" ry="2" />
+<text  x="20.45" y="879.5" ></text>
+</g>
+<g >
+<title>native_read_msr (2 samples, 0.01%)</title><rect x="31.7" y="709" width="0.2" height="15.0" fill="rgb(212,29,35)" rx="2" ry="2" />
+<text  x="34.75" y="719.5" ></text>
+</g>
+<g >
+<title>__tcp_push_pending_frames (7 samples, 0.05%)</title><rect x="19.8" y="805" width="0.6" height="15.0" fill="rgb(212,61,3)" rx="2" ry="2" />
+<text  x="22.82" y="815.5" ></text>
+</g>
+<g >
+<title>yield_task_fair (3 samples, 0.02%)</title><rect x="136.0" y="837" width="0.2" height="15.0" fill="rgb(240,130,24)" rx="2" ry="2" />
+<text  x="138.99" y="847.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.ThreadHelper::ThreadStart (2 samples, 0.01%)</title><rect x="1189.8" y="837" width="0.2" height="15.0" fill="rgb(217,61,40)" rx="2" ry="2" />
+<text  x="1192.83" y="847.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (4 samples, 0.03%)</title><rect x="10.0" y="789" width="0.3" height="15.0" fill="rgb(210,210,2)" rx="2" ry="2" />
+<text  x="13.00" y="799.5" ></text>
+</g>
+<g >
+<title>perf_event_update_userpage (16 samples, 0.11%)</title><rect x="120.5" y="693" width="1.4" height="15.0" fill="rgb(213,56,15)" rx="2" ry="2" />
+<text  x="123.50" y="703.5" ></text>
+</g>
+<g >
+<title>asm_call_sysvec_on_stack (4 samples, 0.03%)</title><rect x="1181.1" y="453" width="0.4" height="15.0" fill="rgb(222,189,53)" rx="2" ry="2" />
+<text  x="1184.12" y="463.5" ></text>
+</g>
+<g >
+<title>void [System.Private.CoreLib] System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1[System.Threading.Tasks.VoidTaskResult]::AwaitUnsafeOnCompleted (2 samples, 0.01%)</title><rect x="1179.8" y="757" width="0.1" height="15.0" fill="rgb(218,167,35)" rx="2" ry="2" />
+<text  x="1182.76" y="767.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge.constprop.0 (36 samples, 0.26%)</title><rect x="13.1" y="725" width="3.1" height="15.0" fill="rgb(212,20,37)" rx="2" ry="2" />
+<text  x="16.13" y="735.5" ></text>
+</g>
+<g >
+<title>bool [System.Private.CoreLib] System.Threading.ThreadPool::UnsafeQueueUserWorkItem (2 samples, 0.01%)</title><rect x="138.4" y="725" width="0.2" height="15.0" fill="rgb(232,68,25)" rx="2" ry="2" />
+<text  x="141.44" y="735.5" ></text>
+</g>
+<g >
+<title>instance class [System.ComponentModel]System.IServiceProvider [Microsoft.AspNetCore.Http] Microsoft.AspNetCore.Http.Features.RequestServicesFeature::get_RequestServices (3 samples, 0.02%)</title><rect x="1176.3" y="549" width="0.2" height="15.0" fill="rgb(229,97,39)" rx="2" ry="2" />
+<text  x="1179.29" y="559.5" ></text>
+</g>
+<g >
+<title>ManagedThreadBase_DispatchOuter (12,326 samples, 88.38%)</title><rect x="137.4" y="885" width="1043.0" height="15.0" fill="rgb(219,87,8)" rx="2" ry="2" />
+<text  x="140.43" y="895.5" >ManagedThreadBase_DispatchOuter</text>
+</g>
+<g >
+<title>__x64_sys_getrusage (3 samples, 0.02%)</title><rect x="123.1" y="869" width="0.3" height="15.0" fill="rgb(210,175,20)" rx="2" ry="2" />
+<text  x="126.13" y="879.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (5 samples, 0.04%)</title><rect x="18.1" y="933" width="0.4" height="15.0" fill="rgb(239,81,10)" rx="2" ry="2" />
+<text  x="21.12" y="943.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker::ResultNext (23 samples, 0.16%)</title><rect x="1176.7" y="565" width="2.0" height="15.0" fill="rgb(241,101,32)" rx="2" ry="2" />
+<text  x="1179.72" y="575.5" ></text>
+</g>
+<g >
+<title>sysvec_apic_timer_interrupt (5 samples, 0.04%)</title><rect x="94.3" y="789" width="0.4" height="15.0" fill="rgb(214,215,49)" rx="2" ry="2" />
+<text  x="97.27" y="799.5" ></text>
+</g>
+<g >
+<title>do_softirq_own_stack (3 samples, 0.02%)</title><rect x="19.1" y="629" width="0.2" height="15.0" fill="rgb(254,111,2)" rx="2" ry="2" />
+<text  x="22.05" y="639.5" ></text>
+</g>
+<g >
+<title>CallDescrWorkerInternal (7 samples, 0.05%)</title><rect x="1181.0" y="805" width="0.6" height="15.0" fill="rgb(243,16,8)" rx="2" ry="2" />
+<text  x="1184.03" y="815.5" ></text>
+</g>
+<g >
+<title>load_balance (10 samples, 0.07%)</title><rect x="94.9" y="789" width="0.8" height="15.0" fill="rgb(251,37,3)" rx="2" ry="2" />
+<text  x="97.87" y="799.5" ></text>
+</g>
+<g >
+<title>amd_pmu_disable_all (8 samples, 0.06%)</title><rect x="31.2" y="741" width="0.7" height="15.0" fill="rgb(243,68,51)" rx="2" ry="2" />
+<text  x="34.24" y="751.5" ></text>
+</g>
+<g >
+<title>__syscall_return_slowpath (6 samples, 0.04%)</title><rect x="102.0" y="917" width="0.5" height="15.0" fill="rgb(231,180,0)" rx="2" ry="2" />
+<text  x="104.97" y="927.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (16 samples, 0.11%)</title><rect x="1188.5" y="917" width="1.3" height="15.0" fill="rgb(218,206,40)" rx="2" ry="2" />
+<text  x="1191.48" y="927.5" ></text>
+</g>
+<g >
+<title>schedule_tail (4 samples, 0.03%)</title><rect x="17.4" y="917" width="0.4" height="15.0" fill="rgb(230,97,6)" rx="2" ry="2" />
+<text  x="20.45" y="927.5" ></text>
+</g>
+<g >
+<title>ThreadpoolMgr::WorkerThreadStart (12,507 samples, 89.68%)</title><rect x="123.4" y="933" width="1058.2" height="15.0" fill="rgb(209,42,24)" rx="2" ry="2" />
+<text  x="126.38" y="943.5" >ThreadpoolMgr::WorkerThreadStart</text>
+</g>
+<g >
+<title>__wake_up_sync_key (3 samples, 0.02%)</title><rect x="20.2" y="133" width="0.2" height="15.0" fill="rgb(231,65,2)" rx="2" ry="2" />
+<text  x="23.15" y="143.5" ></text>
+</g>
+<g >
+<title>schedule (8 samples, 0.06%)</title><rect x="1187.5" y="853" width="0.6" height="15.0" fill="rgb(245,149,29)" rx="2" ry="2" />
+<text  x="1190.46" y="863.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (4 samples, 0.03%)</title><rect x="10.0" y="837" width="0.3" height="15.0" fill="rgb(221,92,48)" rx="2" ry="2" />
+<text  x="13.00" y="847.5" ></text>
+</g>
+<g >
+<title>Thread::Block (7 samples, 0.05%)</title><rect x="140.2" y="357" width="0.6" height="15.0" fill="rgb(248,198,28)" rx="2" ry="2" />
+<text  x="143.22" y="367.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (8 samples, 0.06%)</title><rect x="1174.4" y="309" width="0.7" height="15.0" fill="rgb(245,206,51)" rx="2" ry="2" />
+<text  x="1177.43" y="319.5" ></text>
+</g>
+<g >
+<title>wake_up_q (12 samples, 0.09%)</title><rect x="22.1" y="869" width="1.0" height="15.0" fill="rgb(215,31,2)" rx="2" ry="2" />
+<text  x="25.10" y="879.5" ></text>
+</g>
+<g >
+<title>JIT_MonExit_Signal (4 samples, 0.03%)</title><rect x="1181.1" y="661" width="0.4" height="15.0" fill="rgb(228,83,11)" rx="2" ry="2" />
+<text  x="1184.12" y="671.5" ></text>
+</g>
+<g >
+<title>ip_local_out (4 samples, 0.03%)</title><rect x="19.1" y="741" width="0.3" height="15.0" fill="rgb(247,90,39)" rx="2" ry="2" />
+<text  x="22.05" y="751.5" ></text>
+</g>
+<g >
+<title>__secure_computing (5 samples, 0.04%)</title><rect x="140.4" y="181" width="0.4" height="15.0" fill="rgb(215,227,20)" rx="2" ry="2" />
+<text  x="143.39" y="191.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (3 samples, 0.02%)</title><rect x="129.6" y="805" width="0.2" height="15.0" fill="rgb(223,74,21)" rx="2" ry="2" />
+<text  x="132.56" y="815.5" ></text>
+</g>
+<g >
+<title>tick_sched_handle.isra.0 (5 samples, 0.04%)</title><rect x="1170.3" y="357" width="0.4" height="15.0" fill="rgb(241,7,33)" rx="2" ry="2" />
+<text  x="1173.29" y="367.5" ></text>
+</g>
+<g >
+<title>ThreadNative::KickOffThread (5 samples, 0.04%)</title><rect x="16.7" y="933" width="0.4" height="15.0" fill="rgb(231,6,0)" rx="2" ry="2" />
+<text  x="19.68" y="943.5" ></text>
+</g>
+<g >
+<title>syscall_return_via_sysret (3 samples, 0.02%)</title><rect x="137.1" y="885" width="0.2" height="15.0" fill="rgb(247,44,27)" rx="2" ry="2" />
+<text  x="140.09" y="895.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (24 samples, 0.17%)</title><rect x="119.8" y="709" width="2.1" height="15.0" fill="rgb(225,84,37)" rx="2" ry="2" />
+<text  x="122.83" y="719.5" ></text>
+</g>
+<g >
+<title>ManagedPerAppDomainTPCount::DispatchWorkItem (12,327 samples, 88.39%)</title><rect x="137.4" y="917" width="1043.0" height="15.0" fill="rgb(215,83,33)" rx="2" ry="2" />
+<text  x="140.43" y="927.5" >ManagedPerAppDomainTPCount::DispatchWorkItem</text>
+</g>
+<g >
+<title>schedule (4 samples, 0.03%)</title><rect x="1181.1" y="533" width="0.4" height="15.0" fill="rgb(218,36,6)" rx="2" ry="2" />
+<text  x="1184.12" y="543.5" ></text>
+</g>
+<g >
+<title>update_process_times (5 samples, 0.04%)</title><rect x="1170.3" y="341" width="0.4" height="15.0" fill="rgb(237,101,7)" rx="2" ry="2" />
+<text  x="1173.29" y="351.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (72 samples, 0.52%)</title><rect x="10.3" y="933" width="6.1" height="15.0" fill="rgb(241,81,2)" rx="2" ry="2" />
+<text  x="13.34" y="943.5" ></text>
+</g>
+<g >
+<title>x86_pmu_disable (8 samples, 0.06%)</title><rect x="31.2" y="757" width="0.7" height="15.0" fill="rgb(238,229,54)" rx="2" ry="2" />
+<text  x="34.24" y="767.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (2 samples, 0.01%)</title><rect x="16.5" y="933" width="0.2" height="15.0" fill="rgb(226,95,12)" rx="2" ry="2" />
+<text  x="19.52" y="943.5" ></text>
+</g>
+<g >
+<title>vfs_read (5 samples, 0.04%)</title><rect x="18.1" y="869" width="0.4" height="15.0" fill="rgb(228,192,16)" rx="2" ry="2" />
+<text  x="21.12" y="879.5" ></text>
+</g>
+<g >
+<title>PerAppDomainTPCountList::GetAppDomainIndexForThreadpoolDispatch (2 samples, 0.01%)</title><rect x="1180.6" y="917" width="0.2" height="15.0" fill="rgb(219,140,9)" rx="2" ry="2" />
+<text  x="1183.61" y="927.5" ></text>
+</g>
+<g >
+<title>instance class [System.Diagnostics.DiagnosticSource]System.Diagnostics.Activity [Microsoft.AspNetCore.Hosting] Microsoft.AspNetCore.Hosting.HostingApplicationDiagnostics::StartActivity (3 samples, 0.02%)</title><rect x="139.2" y="741" width="0.3" height="15.0" fill="rgb(229,102,34)" rx="2" ry="2" />
+<text  x="142.20" y="751.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.Tasks.Task::RunContinuations (6 samples, 0.04%)</title><rect x="1181.1" y="709" width="0.5" height="15.0" fill="rgb(248,150,8)" rx="2" ry="2" />
+<text  x="1184.12" y="719.5" ></text>
+</g>
+<g >
+<title>amd_pmu_wait_on_overflow (3 samples, 0.02%)</title><rect x="1170.3" y="245" width="0.2" height="15.0" fill="rgb(242,183,7)" rx="2" ry="2" />
+<text  x="1173.29" y="255.5" ></text>
+</g>
+<g >
+<title>__sysvec_call_function_single (4 samples, 0.03%)</title><rect x="1181.1" y="437" width="0.4" height="15.0" fill="rgb(251,103,17)" rx="2" ry="2" />
+<text  x="1184.12" y="447.5" ></text>
+</g>
+<g >
+<title>net_rx_action (4 samples, 0.03%)</title><rect x="20.1" y="565" width="0.3" height="15.0" fill="rgb(213,50,40)" rx="2" ry="2" />
+<text  x="23.07" y="575.5" ></text>
+</g>
+<g >
+<title>__sysvec_apic_timer_interrupt (4 samples, 0.03%)</title><rect x="24.3" y="949" width="0.3" height="15.0" fill="rgb(209,167,39)" rx="2" ry="2" />
+<text  x="27.30" y="959.5" ></text>
+</g>
+<g >
+<title>__secure_computing (6 samples, 0.04%)</title><rect x="129.9" y="789" width="0.5" height="15.0" fill="rgb(218,25,33)" rx="2" ry="2" />
+<text  x="132.90" y="799.5" ></text>
+</g>
+<g >
+<title>sysvec_apic_timer_interrupt (4 samples, 0.03%)</title><rect x="20.6" y="933" width="0.3" height="15.0" fill="rgb(229,175,11)" rx="2" ry="2" />
+<text  x="23.58" y="943.5" ></text>
+</g>
+<g >
+<title>__lll_lock_wait (9 samples, 0.06%)</title><rect x="20.6" y="965" width="0.7" height="15.0" fill="rgb(230,105,5)" rx="2" ry="2" />
+<text  x="23.58" y="975.5" ></text>
+</g>
+<g >
+<title>futex_wait (59 samples, 0.42%)</title><rect x="1182.5" y="885" width="5.0" height="15.0" fill="rgb(238,150,48)" rx="2" ry="2" />
+<text  x="1185.47" y="895.5" ></text>
+</g>
+<g >
+<title>tcp_v4_rcv (3 samples, 0.02%)</title><rect x="20.2" y="213" width="0.2" height="15.0" fill="rgb(248,227,9)" rx="2" ry="2" />
+<text  x="23.15" y="223.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2 samples, 0.01%)</title><rect x="16.5" y="949" width="0.2" height="15.0" fill="rgb(227,189,22)" rx="2" ry="2" />
+<text  x="19.52" y="959.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (4 samples, 0.03%)</title><rect x="10.0" y="757" width="0.3" height="15.0" fill="rgb(211,163,43)" rx="2" ry="2" />
+<text  x="13.00" y="767.5" ></text>
+</g>
+<g >
+<title>ip_rcv_finish (3 samples, 0.02%)</title><rect x="20.2" y="277" width="0.2" height="15.0" fill="rgb(236,93,5)" rx="2" ry="2" />
+<text  x="23.15" y="287.5" ></text>
+</g>
+<g >
+<title>__const_udelay (2 samples, 0.01%)</title><rect x="1170.4" y="229" width="0.1" height="15.0" fill="rgb(244,197,24)" rx="2" ry="2" />
+<text  x="1173.37" y="239.5" ></text>
+</g>
+<g >
+<title>ManagedPerAppDomainTPCount::SetAppDomainRequestsActive (3 samples, 0.02%)</title><rect x="16.8" y="725" width="0.2" height="15.0" fill="rgb(252,106,31)" rx="2" ry="2" />
+<text  x="19.77" y="735.5" ></text>
+</g>
+<g >
+<title>__libc_send (14 samples, 0.10%)</title><rect x="19.4" y="965" width="1.2" height="15.0" fill="rgb(246,29,10)" rx="2" ry="2" />
+<text  x="22.39" y="975.5" ></text>
+</g>
+<g >
+<title>class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Http.Abstractions] Microsoft.AspNetCore.Http.HttpResponseWritingExtensions::WriteAsync (10 samples, 0.07%)</title><rect x="1177.0" y="501" width="0.8" height="15.0" fill="rgb(207,134,30)" rx="2" ry="2" />
+<text  x="1179.97" y="511.5" ></text>
+</g>
+<g >
+<title>delay_halt_mwaitx (2 samples, 0.01%)</title><rect x="31.3" y="677" width="0.2" height="15.0" fill="rgb(250,74,2)" rx="2" ry="2" />
+<text  x="34.32" y="687.5" ></text>
+</g>
+<g >
+<title>scheduler_tick (4 samples, 0.03%)</title><rect x="1170.3" y="325" width="0.3" height="15.0" fill="rgb(251,60,38)" rx="2" ry="2" />
+<text  x="1173.29" y="335.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker::InvokeActionMethodAsync (12,246 samples, 87.81%)</title><rect x="140.0" y="517" width="1036.2" height="15.0" fill="rgb(229,157,33)" rx="2" ry="2" />
+<text  x="143.05" y="527.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerAct..</text>
+</g>
+<g >
+<title>native_sched_clock (16 samples, 0.11%)</title><rect x="14.1" y="613" width="1.4" height="15.0" fill="rgb(244,204,21)" rx="2" ry="2" />
+<text  x="17.15" y="623.5" ></text>
+</g>
+<g >
+<title>syscall_trace_enter (10 samples, 0.07%)</title><rect x="136.2" y="853" width="0.9" height="15.0" fill="rgb(223,124,31)" rx="2" ry="2" />
+<text  x="139.24" y="863.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="139.3" y="677" width="0.2" height="15.0" fill="rgb(222,0,0)" rx="2" ry="2" />
+<text  x="142.29" y="687.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (4 samples, 0.03%)</title><rect x="10.0" y="805" width="0.3" height="15.0" fill="rgb(233,95,38)" rx="2" ry="2" />
+<text  x="13.00" y="815.5" ></text>
+</g>
+<g >
+<title>switch_fpu_return (6 samples, 0.04%)</title><rect x="102.0" y="885" width="0.5" height="15.0" fill="rgb(231,179,18)" rx="2" ry="2" />
+<text  x="104.97" y="895.5" ></text>
+</g>
+<g >
+<title>yield_task_fair (2 samples, 0.01%)</title><rect x="135.8" y="821" width="0.2" height="15.0" fill="rgb(254,17,6)" rx="2" ry="2" />
+<text  x="138.82" y="831.5" ></text>
+</g>
+<g >
+<title>object [Anonymously Hosted DynamicMethods Assembly] dynamicClass::lambda_method1 (12,235 samples, 87.73%)</title><rect x="141.0" y="485" width="1035.2" height="15.0" fill="rgb(233,58,0)" rx="2" ry="2" />
+<text  x="143.98" y="495.5" >object [Anonymously Hosted DynamicMethods Assembly] dynamicClass::lambda_method1</text>
+</g>
+<g >
+<title>br_handle_frame (4 samples, 0.03%)</title><rect x="20.1" y="485" width="0.3" height="15.0" fill="rgb(245,65,17)" rx="2" ry="2" />
+<text  x="23.07" y="495.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (4 samples, 0.03%)</title><rect x="1187.5" y="757" width="0.3" height="15.0" fill="rgb(234,170,5)" rx="2" ry="2" />
+<text  x="1190.46" y="767.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.Http1OutputProducer::WriteResponseHeaders (4 samples, 0.03%)</title><rect x="1177.1" y="437" width="0.4" height="15.0" fill="rgb(220,179,26)" rx="2" ry="2" />
+<text  x="1180.14" y="447.5" ></text>
+</g>
+<g >
+<title>schedule (233 samples, 1.67%)</title><rect x="103.2" y="853" width="19.7" height="15.0" fill="rgb(233,60,6)" rx="2" ry="2" />
+<text  x="106.16" y="863.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (693 samples, 4.97%)</title><rect x="35.6" y="789" width="58.7" height="15.0" fill="rgb(222,227,46)" rx="2" ry="2" />
+<text  x="38.64" y="799.5" >perf_e..</text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (8 samples, 0.06%)</title><rect x="1174.4" y="277" width="0.7" height="15.0" fill="rgb(238,125,44)" rx="2" ry="2" />
+<text  x="1177.43" y="287.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (5 samples, 0.04%)</title><rect x="1181.7" y="933" width="0.4" height="15.0" fill="rgb(223,204,40)" rx="2" ry="2" />
+<text  x="1184.71" y="943.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (4 samples, 0.03%)</title><rect x="1187.8" y="709" width="0.3" height="15.0" fill="rgb(239,93,14)" rx="2" ry="2" />
+<text  x="1190.80" y="719.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_out (3 samples, 0.02%)</title><rect x="133.1" y="789" width="0.3" height="15.0" fill="rgb(223,204,22)" rx="2" ry="2" />
+<text  x="136.11" y="799.5" ></text>
+</g>
+<g >
+<title>__alloc_skb (2 samples, 0.01%)</title><rect x="19.6" y="805" width="0.2" height="15.0" fill="rgb(231,38,19)" rx="2" ry="2" />
+<text  x="22.65" y="815.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (12 samples, 0.09%)</title><rect x="1172.7" y="357" width="1.1" height="15.0" fill="rgb(227,10,12)" rx="2" ry="2" />
+<text  x="1175.74" y="367.5" ></text>
+</g>
+<g >
+<title>schedule (4 samples, 0.03%)</title><rect x="10.0" y="853" width="0.3" height="15.0" fill="rgb(226,88,0)" rx="2" ry="2" />
+<text  x="13.00" y="863.5" ></text>
+</g>
+<g >
+<title>sched_clock_cpu (16 samples, 0.11%)</title><rect x="14.1" y="629" width="1.4" height="15.0" fill="rgb(228,119,0)" rx="2" ry="2" />
+<text  x="17.15" y="639.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (40 samples, 0.29%)</title><rect x="1183.3" y="805" width="3.4" height="15.0" fill="rgb(217,29,15)" rx="2" ry="2" />
+<text  x="1186.32" y="815.5" ></text>
+</g>
+<g >
+<title>ThreadpoolMgr::TimerThreadStart (3 samples, 0.02%)</title><rect x="1188.1" y="933" width="0.3" height="15.0" fill="rgb(211,6,41)" rx="2" ry="2" />
+<text  x="1191.14" y="943.5" ></text>
+</g>
+<g >
+<title>all (13,946 samples, 100%)</title><rect x="10.0" y="997" width="1180.0" height="15.0" fill="rgb(254,180,29)" rx="2" ry="2" />
+<text  x="13.00" y="1007.5" ></text>
+</g>
+<g >
+<title>UnManagedPerAppDomainTPCount::DispatchWorkItem (8 samples, 0.06%)</title><rect x="1180.9" y="917" width="0.7" height="15.0" fill="rgb(241,20,13)" rx="2" ry="2" />
+<text  x="1183.95" y="927.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (693 samples, 4.97%)</title><rect x="35.6" y="773" width="58.7" height="15.0" fill="rgb(248,83,43)" rx="2" ry="2" />
+<text  x="38.64" y="783.5" >ctx_sc..</text>
+</g>
+<g >
+<title>CorUnix::CPalThread::~CPalThread (2 samples, 0.01%)</title><rect x="17.1" y="949" width="0.2" height="15.0" fill="rgb(212,189,22)" rx="2" ry="2" />
+<text  x="20.11" y="959.5" ></text>
+</g>
+<g >
+<title>MethodDescCallSite::CallTargetWorker (5 samples, 0.04%)</title><rect x="16.7" y="869" width="0.4" height="15.0" fill="rgb(226,87,0)" rx="2" ry="2" />
+<text  x="19.68" y="879.5" ></text>
+</g>
+<g >
+<title>futex_wait_queue_me (799 samples, 5.73%)</title><rect x="29.0" y="869" width="67.6" height="15.0" fill="rgb(230,120,7)" rx="2" ry="2" />
+<text  x="31.95" y="879.5" >futex_w..</text>
+</g>
+<g >
+<title>idtentry_exit_cond_rcu (23 samples, 0.16%)</title><rect x="1170.8" y="421" width="1.9" height="15.0" fill="rgb(239,80,0)" rx="2" ry="2" />
+<text  x="1173.79" y="431.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb_one_core (3 samples, 0.02%)</title><rect x="19.1" y="533" width="0.2" height="15.0" fill="rgb(239,128,5)" rx="2" ry="2" />
+<text  x="22.05" y="543.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker::Next (12,254 samples, 87.87%)</title><rect x="139.7" y="597" width="1036.8" height="15.0" fill="rgb(227,143,2)" rx="2" ry="2" />
+<text  x="142.71" y="607.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerAct..</text>
+</g>
+<g >
+<title>ttwu_do_activate (4 samples, 0.03%)</title><rect x="22.5" y="837" width="0.4" height="15.0" fill="rgb(233,53,15)" rx="2" ry="2" />
+<text  x="25.52" y="847.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_out (12 samples, 0.09%)</title><rect x="31.0" y="821" width="1.0" height="15.0" fill="rgb(229,165,23)" rx="2" ry="2" />
+<text  x="33.98" y="831.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalThread::ThreadEntry (2 samples, 0.01%)</title><rect x="1189.8" y="949" width="0.2" height="15.0" fill="rgb(231,70,26)" rx="2" ry="2" />
+<text  x="1192.83" y="959.5" ></text>
+</g>
+<g >
+<title>instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;valuetype System.IO.Pipelines.FlushResult&gt; [System.IO.Pipelines] System.IO.Pipelines.Pipe+DefaultPipeWriter::FlushAsync (3 samples, 0.02%)</title><rect x="138.4" y="757" width="0.2" height="15.0" fill="rgb(231,25,48)" rx="2" ry="2" />
+<text  x="141.36" y="767.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (4 samples, 0.03%)</title><rect x="10.0" y="821" width="0.3" height="15.0" fill="rgb(221,223,24)" rx="2" ry="2" />
+<text  x="13.00" y="831.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (68 samples, 0.49%)</title><rect x="85.5" y="709" width="5.7" height="15.0" fill="rgb(245,67,47)" rx="2" ry="2" />
+<text  x="88.47" y="719.5" ></text>
+</g>
+<g >
+<title>syscall_trace_enter (2 samples, 0.01%)</title><rect x="101.8" y="917" width="0.2" height="15.0" fill="rgb(246,112,39)" rx="2" ry="2" />
+<text  x="104.80" y="927.5" ></text>
+</g>
+<g >
+<title>valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;valuetype [System.IO.Pipelines]System.IO.Pipelines.FlushResult&gt; [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.Http1OutputProducer::&lt;FlushAsync&gt;g__FlushAsyncChunked|39_0 (3 samples, 0.02%)</title><rect x="1177.6" y="437" width="0.2" height="15.0" fill="rgb(213,198,29)" rx="2" ry="2" />
+<text  x="1180.56" y="447.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (63 samples, 0.45%)</title><rect x="1182.1" y="933" width="5.4" height="15.0" fill="rgb(207,7,21)" rx="2" ry="2" />
+<text  x="1185.13" y="943.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb (3 samples, 0.02%)</title><rect x="20.2" y="357" width="0.2" height="15.0" fill="rgb(232,218,19)" rx="2" ry="2" />
+<text  x="23.15" y="367.5" ></text>
+</g>
+<g >
+<title>ManagedThreadBase::ThreadPool (12,327 samples, 88.39%)</title><rect x="137.4" y="901" width="1043.0" height="15.0" fill="rgb(217,41,34)" rx="2" ry="2" />
+<text  x="140.43" y="911.5" >ManagedThreadBase::ThreadPool</text>
+</g>
+<g >
+<title>fam_ops (2 samples, 0.01%)</title><rect x="136.9" y="821" width="0.2" height="15.0" fill="rgb(222,95,14)" rx="2" ry="2" />
+<text  x="139.92" y="831.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.TimerQueue::FireNextTimers (7 samples, 0.05%)</title><rect x="1181.0" y="789" width="0.6" height="15.0" fill="rgb(241,28,22)" rx="2" ry="2" />
+<text  x="1184.03" y="799.5" ></text>
+</g>
+<g >
+<title>__sysvec_apic_timer_interrupt (4 samples, 0.03%)</title><rect x="20.6" y="917" width="0.3" height="15.0" fill="rgb(221,48,39)" rx="2" ry="2" />
+<text  x="23.58" y="927.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (24 samples, 0.17%)</title><rect x="91.2" y="725" width="2.1" height="15.0" fill="rgb(221,224,54)" rx="2" ry="2" />
+<text  x="94.23" y="735.5" ></text>
+</g>
+<g >
+<title>asm_sysvec_apic_timer_interrupt (30 samples, 0.22%)</title><rect x="1170.2" y="453" width="2.5" height="15.0" fill="rgb(215,154,15)" rx="2" ry="2" />
+<text  x="1173.20" y="463.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (12 samples, 0.09%)</title><rect x="1172.7" y="405" width="1.1" height="15.0" fill="rgb(238,214,33)" rx="2" ry="2" />
+<text  x="1175.74" y="415.5" ></text>
+</g>
+<g >
+<title>ObjectNative::GetClass (2 samples, 0.01%)</title><rect x="1176.5" y="581" width="0.2" height="15.0" fill="rgb(235,5,19)" rx="2" ry="2" />
+<text  x="1179.55" y="591.5" ></text>
+</g>
+<g >
+<title>tcp_rcv_established (3 samples, 0.02%)</title><rect x="20.2" y="181" width="0.2" height="15.0" fill="rgb(214,201,39)" rx="2" ry="2" />
+<text  x="23.15" y="191.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (16 samples, 0.11%)</title><rect x="1188.5" y="773" width="1.3" height="15.0" fill="rgb(224,222,50)" rx="2" ry="2" />
+<text  x="1191.48" y="783.5" ></text>
+</g>
+<g >
+<title>inet6_recvmsg (6 samples, 0.04%)</title><rect x="18.9" y="869" width="0.5" height="15.0" fill="rgb(253,51,14)" rx="2" ry="2" />
+<text  x="21.88" y="879.5" ></text>
+</g>
+<g >
+<title>pick_next_task_fair (4 samples, 0.03%)</title><rect x="1186.7" y="821" width="0.3" height="15.0" fill="rgb(251,189,7)" rx="2" ry="2" />
+<text  x="1189.70" y="831.5" ></text>
+</g>
+<g >
+<title>_nv032823rm (2 samples, 0.01%)</title><rect x="1169.9" y="453" width="0.1" height="15.0" fill="rgb(242,151,42)" rx="2" ry="2" />
+<text  x="1172.86" y="463.5" ></text>
+</g>
+<g >
+<title>PAL_WaitForSingleObjectPrioritized (36 samples, 0.26%)</title><rect x="127.9" y="901" width="3.0" height="15.0" fill="rgb(220,148,50)" rx="2" ry="2" />
+<text  x="130.86" y="911.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb_core (4 samples, 0.03%)</title><rect x="20.1" y="501" width="0.3" height="15.0" fill="rgb(229,16,53)" rx="2" ry="2" />
+<text  x="23.07" y="511.5" ></text>
+</g>
+<g >
+<title>perf_event_update_userpage (4 samples, 0.03%)</title><rect x="1187.8" y="693" width="0.3" height="15.0" fill="rgb(205,220,48)" rx="2" ry="2" />
+<text  x="1190.80" y="703.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (12 samples, 0.09%)</title><rect x="129.4" y="821" width="1.0" height="15.0" fill="rgb(225,227,46)" rx="2" ry="2" />
+<text  x="132.39" y="831.5" ></text>
+</g>
+<g >
+<title>sock_def_readable (3 samples, 0.02%)</title><rect x="20.2" y="149" width="0.2" height="15.0" fill="rgb(220,118,36)" rx="2" ry="2" />
+<text  x="23.15" y="159.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (69 samples, 0.49%)</title><rect x="10.6" y="805" width="5.8" height="15.0" fill="rgb(244,39,17)" rx="2" ry="2" />
+<text  x="13.59" y="815.5" ></text>
+</g>
+<g >
+<title>CorUnix::InternalWaitForMultipleObjectsEx (34 samples, 0.24%)</title><rect x="128.0" y="885" width="2.9" height="15.0" fill="rgb(226,226,50)" rx="2" ry="2" />
+<text  x="131.03" y="895.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (20 samples, 0.14%)</title><rect x="1171.0" y="293" width="1.7" height="15.0" fill="rgb(245,23,11)" rx="2" ry="2" />
+<text  x="1174.05" y="303.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (16 samples, 0.11%)</title><rect x="1188.5" y="757" width="1.3" height="15.0" fill="rgb(219,174,29)" rx="2" ry="2" />
+<text  x="1191.48" y="767.5" ></text>
+</g>
+<g >
+<title>do_sched_yield (41 samples, 0.29%)</title><rect x="132.5" y="837" width="3.5" height="15.0" fill="rgb(234,22,1)" rx="2" ry="2" />
+<text  x="135.52" y="847.5" ></text>
+</g>
+<g >
+<title>cgroup_rstat_updated (2 samples, 0.01%)</title><rect x="134.8" y="741" width="0.2" height="15.0" fill="rgb(214,129,24)" rx="2" ry="2" />
+<text  x="137.80" y="751.5" ></text>
+</g>
+<g >
+<title>instance object [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Controllers.ControllerFactoryProvider+&lt;&gt;c__DisplayClass5_0::&lt;CreateControllerFactory&gt;g__CreateController|0 (3 samples, 0.02%)</title><rect x="1176.3" y="581" width="0.2" height="15.0" fill="rgb(221,89,0)" rx="2" ry="2" />
+<text  x="1179.29" y="591.5" ></text>
+</g>
+<g >
+<title>cpumask_next_and (2 samples, 0.01%)</title><rect x="95.5" y="741" width="0.2" height="15.0" fill="rgb(237,159,10)" rx="2" ry="2" />
+<text  x="98.54" y="751.5" ></text>
+</g>
+<g >
+<title>ThreadNative::KickOffThread (2 samples, 0.01%)</title><rect x="1189.8" y="933" width="0.2" height="15.0" fill="rgb(205,217,43)" rx="2" ry="2" />
+<text  x="1192.83" y="943.5" ></text>
+</g>
+<g >
+<title>do_softirq.part.0 (3 samples, 0.02%)</title><rect x="19.1" y="645" width="0.2" height="15.0" fill="rgb(230,212,24)" rx="2" ry="2" />
+<text  x="22.05" y="655.5" ></text>
+</g>
+<g >
+<title>instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;valuetype System.IO.Pipelines.FlushResult&gt; [System.IO.Pipelines] System.IO.Pipelines.Pipe::FlushAsync (3 samples, 0.02%)</title><rect x="1177.6" y="389" width="0.2" height="15.0" fill="rgb(227,43,3)" rx="2" ry="2" />
+<text  x="1180.56" y="399.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker::InvokeAsync (12,281 samples, 88.06%)</title><rect x="139.6" y="661" width="1039.1" height="15.0" fill="rgb(221,120,31)" rx="2" ry="2" />
+<text  x="142.63" y="671.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvok..</text>
+</g>
+<g >
+<title>finish_task_switch (12 samples, 0.09%)</title><rect x="1172.7" y="341" width="1.1" height="15.0" fill="rgb(209,208,13)" rx="2" ry="2" />
+<text  x="1175.74" y="351.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (64 samples, 0.46%)</title><rect x="10.8" y="789" width="5.4" height="15.0" fill="rgb(221,134,42)" rx="2" ry="2" />
+<text  x="13.76" y="799.5" ></text>
+</g>
+<g >
+<title>native_sched_clock (4 samples, 0.03%)</title><rect x="121.5" y="645" width="0.4" height="15.0" fill="rgb(221,168,51)" rx="2" ry="2" />
+<text  x="124.52" y="655.5" ></text>
+</g>
+<g >
+<title>pthread_cond_timedwait@@GLIBC_2.3.2 (4 samples, 0.03%)</title><rect x="10.0" y="965" width="0.3" height="15.0" fill="rgb(238,55,24)" rx="2" ry="2" />
+<text  x="13.00" y="975.5" ></text>
+</g>
+<g >
+<title>ip_output (4 samples, 0.03%)</title><rect x="20.1" y="709" width="0.3" height="15.0" fill="rgb(217,135,35)" rx="2" ry="2" />
+<text  x="23.07" y="719.5" ></text>
+</g>
+<g >
+<title>__secure_computing (2 samples, 0.01%)</title><rect x="20.4" y="901" width="0.2" height="15.0" fill="rgb(244,65,31)" rx="2" ry="2" />
+<text  x="23.41" y="911.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (40 samples, 0.29%)</title><rect x="1183.3" y="773" width="3.4" height="15.0" fill="rgb(252,66,50)" rx="2" ry="2" />
+<text  x="1186.32" y="783.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker::Next (12,279 samples, 88.05%)</title><rect x="139.7" y="629" width="1039.0" height="15.0" fill="rgb(209,159,42)" rx="2" ry="2" />
+<text  x="142.71" y="639.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvok..</text>
+</g>
+<g >
+<title>epoll_wait (72 samples, 0.52%)</title><rect x="10.3" y="949" width="6.1" height="15.0" fill="rgb(218,29,6)" rx="2" ry="2" />
+<text  x="13.34" y="959.5" ></text>
+</g>
+<g >
+<title>instance class System.Diagnostics.Activity [System.Diagnostics.DiagnosticSource] System.Diagnostics.Activity::Start (2 samples, 0.01%)</title><rect x="139.3" y="725" width="0.2" height="15.0" fill="rgb(225,217,4)" rx="2" ry="2" />
+<text  x="142.29" y="735.5" ></text>
+</g>
+<g >
+<title>instance class Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal.SocketAwaitableEventArgs [Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets] Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal.SocketSender::SendAsync (2 samples, 0.01%)</title><rect x="138.0" y="725" width="0.2" height="15.0" fill="rgb(222,213,29)" rx="2" ry="2" />
+<text  x="141.02" y="735.5" ></text>
+</g>
+<g >
+<title>__kmalloc_reserve.isra.0 (2 samples, 0.01%)</title><rect x="19.6" y="789" width="0.2" height="15.0" fill="rgb(224,190,36)" rx="2" ry="2" />
+<text  x="22.65" y="799.5" ></text>
+</g>
+<g >
+<title>_extract_crng (2 samples, 0.01%)</title><rect x="139.3" y="517" width="0.2" height="15.0" fill="rgb(227,111,6)" rx="2" ry="2" />
+<text  x="142.29" y="527.5" ></text>
+</g>
+<g >
+<title>hrtimer_interrupt (5 samples, 0.04%)</title><rect x="94.3" y="741" width="0.4" height="15.0" fill="rgb(237,143,49)" rx="2" ry="2" />
+<text  x="97.27" y="751.5" ></text>
+</g>
+<g >
+<title>schedule (12 samples, 0.09%)</title><rect x="1172.7" y="373" width="1.1" height="15.0" fill="rgb(206,172,50)" rx="2" ry="2" />
+<text  x="1175.74" y="383.5" ></text>
+</g>
+<g >
+<title>__pthread_disable_asynccancel (6 samples, 0.04%)</title><rect x="21.3" y="965" width="0.5" height="15.0" fill="rgb(233,9,27)" rx="2" ry="2" />
+<text  x="24.34" y="975.5" ></text>
+</g>
+<g >
+<title>asm_sysvec_call_function_single (12 samples, 0.09%)</title><rect x="1172.7" y="453" width="1.1" height="15.0" fill="rgb(233,91,28)" rx="2" ry="2" />
+<text  x="1175.74" y="463.5" ></text>
+</g>
+<g >
+<title>event_sched_in.isra.0 (52 samples, 0.37%)</title><rect x="117.5" y="725" width="4.4" height="15.0" fill="rgb(237,61,12)" rx="2" ry="2" />
+<text  x="120.46" y="735.5" ></text>
+</g>
+<g >
+<title>rb_erase (4 samples, 0.03%)</title><rect x="1187.1" y="821" width="0.4" height="15.0" fill="rgb(212,48,49)" rx="2" ry="2" />
+<text  x="1190.12" y="831.5" ></text>
+</g>
+<g >
+<title>__wake_up_common_lock (3 samples, 0.02%)</title><rect x="20.2" y="117" width="0.2" height="15.0" fill="rgb(212,203,25)" rx="2" ry="2" />
+<text  x="23.15" y="127.5" ></text>
+</g>
+<g >
+<title>schedule (54 samples, 0.39%)</title><rect x="1182.6" y="853" width="4.5" height="15.0" fill="rgb(251,59,27)" rx="2" ry="2" />
+<text  x="1185.55" y="863.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.ManualResetEventSlim::Set (6 samples, 0.04%)</title><rect x="1181.1" y="693" width="0.5" height="15.0" fill="rgb(238,40,24)" rx="2" ry="2" />
+<text  x="1184.12" y="703.5" ></text>
+</g>
+<g >
+<title>event_sched_in.isra.0 (112 samples, 0.80%)</title><rect x="81.8" y="725" width="9.4" height="15.0" fill="rgb(206,27,12)" rx="2" ry="2" />
+<text  x="84.75" y="735.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (8 samples, 0.06%)</title><rect x="1187.5" y="773" width="0.6" height="15.0" fill="rgb(252,58,4)" rx="2" ry="2" />
+<text  x="1190.46" y="783.5" ></text>
+</g>
+<g >
+<title>idtentry_exit_cond_rcu (12 samples, 0.09%)</title><rect x="1172.7" y="421" width="1.1" height="15.0" fill="rgb(244,161,42)" rx="2" ry="2" />
+<text  x="1175.74" y="431.5" ></text>
+</g>
+<g >
+<title>SVR::gc_heap::soh_try_fit (2 samples, 0.01%)</title><rect x="1176.3" y="437" width="0.2" height="15.0" fill="rgb(216,76,30)" rx="2" ry="2" />
+<text  x="1179.29" y="447.5" ></text>
+</g>
+<g >
+<title>futex_wait_queue_me (16 samples, 0.11%)</title><rect x="1188.5" y="869" width="1.3" height="15.0" fill="rgb(223,52,44)" rx="2" ry="2" />
+<text  x="1191.48" y="879.5" ></text>
+</g>
+<g >
+<title>__do_sys_getrusage (3 samples, 0.02%)</title><rect x="123.1" y="853" width="0.3" height="15.0" fill="rgb(210,0,3)" rx="2" ry="2" />
+<text  x="126.13" y="863.5" ></text>
+</g>
+<g >
+<title>bool [System.Private.CoreLib] System.Threading.ThreadPoolWorkQueue::Dispatch (12,324 samples, 88.37%)</title><rect x="137.4" y="821" width="1042.8" height="15.0" fill="rgb(238,220,14)" rx="2" ry="2" />
+<text  x="140.43" y="831.5" >bool [System.Private.CoreLib] System.Threading.ThreadPoolWorkQueue::Dispatch</text>
+</g>
+<g >
+<title>x86_pmu_disable (2 samples, 0.01%)</title><rect x="103.2" y="757" width="0.1" height="15.0" fill="rgb(237,73,29)" rx="2" ry="2" />
+<text  x="106.16" y="767.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (2 samples, 0.01%)</title><rect x="16.5" y="917" width="0.2" height="15.0" fill="rgb(228,77,45)" rx="2" ry="2" />
+<text  x="19.52" y="927.5" ></text>
+</g>
+<g >
+<title>__lll_unlock_wake (6 samples, 0.04%)</title><rect x="140.3" y="245" width="0.5" height="15.0" fill="rgb(235,201,51)" rx="2" ry="2" />
+<text  x="143.30" y="255.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (230 samples, 1.65%)</title><rect x="103.4" y="821" width="19.5" height="15.0" fill="rgb(254,172,9)" rx="2" ry="2" />
+<text  x="106.41" y="831.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (2 samples, 0.01%)</title><rect x="17.3" y="933" width="0.1" height="15.0" fill="rgb(243,188,24)" rx="2" ry="2" />
+<text  x="20.28" y="943.5" ></text>
+</g>
+<g >
+<title>switch_fpu_return (8 samples, 0.06%)</title><rect x="1175.1" y="373" width="0.7" height="15.0" fill="rgb(234,134,38)" rx="2" ry="2" />
+<text  x="1178.11" y="383.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalObjectBase::ReleaseReference (2 samples, 0.01%)</title><rect x="128.6" y="869" width="0.2" height="15.0" fill="rgb(248,68,32)" rx="2" ry="2" />
+<text  x="131.63" y="879.5" ></text>
+</g>
+<g >
+<title>br_netif_receive_skb (3 samples, 0.02%)</title><rect x="20.2" y="389" width="0.2" height="15.0" fill="rgb(249,30,15)" rx="2" ry="2" />
+<text  x="23.15" y="399.5" ></text>
+</g>
+<g >
+<title>process_backlog (3 samples, 0.02%)</title><rect x="19.1" y="565" width="0.2" height="15.0" fill="rgb(213,138,42)" rx="2" ry="2" />
+<text  x="22.05" y="575.5" ></text>
+</g>
+<g >
+<title>ksys_read (2 samples, 0.01%)</title><rect x="139.3" y="597" width="0.2" height="15.0" fill="rgb(214,178,22)" rx="2" ry="2" />
+<text  x="142.29" y="607.5" ></text>
+</g>
+<g >
+<title>perf_event_idx_default (8 samples, 0.06%)</title><rect x="119.8" y="693" width="0.7" height="15.0" fill="rgb(228,103,38)" rx="2" ry="2" />
+<text  x="122.83" y="703.5" ></text>
+</g>
+<g >
+<title>psi_task_change (2 samples, 0.01%)</title><rect x="16.3" y="789" width="0.1" height="15.0" fill="rgb(237,212,2)" rx="2" ry="2" />
+<text  x="19.26" y="799.5" ></text>
+</g>
+<g >
+<title>ManagedThreadBase::KickOff (5 samples, 0.04%)</title><rect x="16.7" y="917" width="0.4" height="15.0" fill="rgb(252,69,29)" rx="2" ry="2" />
+<text  x="19.68" y="927.5" ></text>
+</g>
+<g >
+<title>br_nf_pre_routing_finish (3 samples, 0.02%)</title><rect x="20.2" y="453" width="0.2" height="15.0" fill="rgb(237,228,16)" rx="2" ry="2" />
+<text  x="23.15" y="463.5" ></text>
+</g>
+<g >
+<title>__syscall_return_slowpath (4 samples, 0.03%)</title><rect x="1181.1" y="565" width="0.4" height="15.0" fill="rgb(212,218,23)" rx="2" ry="2" />
+<text  x="1184.12" y="575.5" ></text>
+</g>
+<g >
+<title>calc_timer_values (4 samples, 0.03%)</title><rect x="1187.8" y="677" width="0.3" height="15.0" fill="rgb(235,79,7)" rx="2" ry="2" />
+<text  x="1190.80" y="687.5" ></text>
+</g>
+<g >
+<title>malloc (2 samples, 0.01%)</title><rect x="21.8" y="965" width="0.2" height="15.0" fill="rgb(230,198,32)" rx="2" ry="2" />
+<text  x="24.85" y="975.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (216 samples, 1.55%)</title><rect x="104.6" y="773" width="18.3" height="15.0" fill="rgb(218,178,8)" rx="2" ry="2" />
+<text  x="107.60" y="783.5" ></text>
+</g>
+<g >
+<title>futex_wait_queue_me (233 samples, 1.67%)</title><rect x="103.2" y="869" width="19.7" height="15.0" fill="rgb(241,137,21)" rx="2" ry="2" />
+<text  x="106.16" y="879.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb (4 samples, 0.03%)</title><rect x="20.1" y="533" width="0.3" height="15.0" fill="rgb(205,133,28)" rx="2" ry="2" />
+<text  x="23.07" y="543.5" ></text>
+</g>
+<g >
+<title>do_futex (4 samples, 0.03%)</title><rect x="10.0" y="901" width="0.3" height="15.0" fill="rgb(248,81,49)" rx="2" ry="2" />
+<text  x="13.00" y="911.5" ></text>
+</g>
+<g >
+<title>arch_perf_update_userpage (8 samples, 0.06%)</title><rect x="13.5" y="645" width="0.6" height="15.0" fill="rgb(217,49,44)" rx="2" ry="2" />
+<text  x="16.47" y="655.5" ></text>
+</g>
+<g >
+<title>ip_sabotage_in (3 samples, 0.02%)</title><rect x="20.2" y="293" width="0.2" height="15.0" fill="rgb(222,166,35)" rx="2" ry="2" />
+<text  x="23.15" y="303.5" ></text>
+</g>
+<g >
+<title>br_pass_frame_up (3 samples, 0.02%)</title><rect x="20.2" y="405" width="0.2" height="15.0" fill="rgb(214,215,47)" rx="2" ry="2" />
+<text  x="23.15" y="415.5" ></text>
+</g>
+<g >
+<title>__x64_sys_read (5 samples, 0.04%)</title><rect x="18.1" y="901" width="0.4" height="15.0" fill="rgb(251,170,39)" rx="2" ry="2" />
+<text  x="21.12" y="911.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (8 samples, 0.06%)</title><rect x="15.5" y="693" width="0.7" height="15.0" fill="rgb(246,17,47)" rx="2" ry="2" />
+<text  x="18.50" y="703.5" ></text>
+</g>
+<g >
+<title>__x64_sys_read (2 samples, 0.01%)</title><rect x="139.3" y="613" width="0.2" height="15.0" fill="rgb(218,135,17)" rx="2" ry="2" />
+<text  x="142.29" y="623.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (2 samples, 0.01%)</title><rect x="139.3" y="629" width="0.2" height="15.0" fill="rgb(205,97,29)" rx="2" ry="2" />
+<text  x="142.29" y="639.5" ></text>
+</g>
+<g >
+<title>br_nf_hook_thresh (3 samples, 0.02%)</title><rect x="20.2" y="437" width="0.2" height="15.0" fill="rgb(248,105,7)" rx="2" ry="2" />
+<text  x="23.15" y="447.5" ></text>
+</g>
+<g >
+<title>ctx_sched_out (3 samples, 0.02%)</title><rect x="133.1" y="757" width="0.3" height="15.0" fill="rgb(243,113,41)" rx="2" ry="2" />
+<text  x="136.11" y="767.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb_one_core (3 samples, 0.02%)</title><rect x="20.2" y="341" width="0.2" height="15.0" fill="rgb(240,176,39)" rx="2" ry="2" />
+<text  x="23.15" y="351.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Authorization.Policy] Microsoft.AspNetCore.Authorization.AuthorizationMiddleware::Invoke (12,287 samples, 88.10%)</title><rect x="139.5" y="741" width="1039.6" height="15.0" fill="rgb(232,39,21)" rx="2" ry="2" />
+<text  x="142.46" y="751.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Authorization.Policy] Microsoft.AspNetCore.Authorization.Author..</text>
+</g>
+<g >
+<title>br_handle_frame_finish (3 samples, 0.02%)</title><rect x="20.2" y="421" width="0.2" height="15.0" fill="rgb(250,138,43)" rx="2" ry="2" />
+<text  x="23.15" y="431.5" ></text>
+</g>
+<g >
+<title>rb_next (8 samples, 0.06%)</title><rect x="1185.3" y="757" width="0.7" height="15.0" fill="rgb(221,7,7)" rx="2" ry="2" />
+<text  x="1188.35" y="767.5" ></text>
+</g>
+<g >
+<title>AppDomainTimerCallback_Worker (7 samples, 0.05%)</title><rect x="1181.0" y="837" width="0.6" height="15.0" fill="rgb(241,83,34)" rx="2" ry="2" />
+<text  x="1184.03" y="847.5" ></text>
+</g>
+<g >
+<title>__clock_gettime (2 samples, 0.01%)</title><rect x="17.3" y="949" width="0.1" height="15.0" fill="rgb(227,77,53)" rx="2" ry="2" />
+<text  x="20.28" y="959.5" ></text>
+</g>
+<g >
+<title>ip_local_deliver_finish (3 samples, 0.02%)</title><rect x="20.2" y="245" width="0.2" height="15.0" fill="rgb(206,111,47)" rx="2" ry="2" />
+<text  x="23.15" y="255.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (8 samples, 0.06%)</title><rect x="1187.5" y="805" width="0.6" height="15.0" fill="rgb(250,54,40)" rx="2" ry="2" />
+<text  x="1190.46" y="815.5" ></text>
+</g>
+<g >
+<title>instance class Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal.SocketAwaitableEventArgs [Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets] Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal.SocketSender::SendAsync (2 samples, 0.01%)</title><rect x="138.0" y="741" width="0.2" height="15.0" fill="rgb(243,43,12)" rx="2" ry="2" />
+<text  x="141.02" y="751.5" ></text>
+</g>
+<g >
+<title>__irqentry_text_end (8 samples, 0.06%)</title><rect x="1169.2" y="453" width="0.7" height="15.0" fill="rgb(242,188,44)" rx="2" ry="2" />
+<text  x="1172.19" y="463.5" ></text>
+</g>
+<g >
+<title>calc_timer_values (4 samples, 0.03%)</title><rect x="121.5" y="677" width="0.4" height="15.0" fill="rgb(224,208,48)" rx="2" ry="2" />
+<text  x="124.52" y="687.5" ></text>
+</g>
+<g >
+<title>__softirqentry_text_start (3 samples, 0.02%)</title><rect x="19.1" y="597" width="0.2" height="15.0" fill="rgb(227,72,2)" rx="2" ry="2" />
+<text  x="22.05" y="607.5" ></text>
+</g>
+<g >
+<title>syscall_return_slowpath (4 samples, 0.03%)</title><rect x="17.8" y="917" width="0.3" height="15.0" fill="rgb(241,89,43)" rx="2" ry="2" />
+<text  x="20.78" y="927.5" ></text>
+</g>
+<g >
+<title>void [System.Private.CoreLib] System.Threading.ExecutionContext::RunInternal (2 samples, 0.01%)</title><rect x="1189.8" y="821" width="0.2" height="15.0" fill="rgb(213,116,35)" rx="2" ry="2" />
+<text  x="1192.83" y="831.5" ></text>
+</g>
+<g >
+<title>timerqueue_del (4 samples, 0.03%)</title><rect x="101.5" y="837" width="0.3" height="15.0" fill="rgb(222,99,18)" rx="2" ry="2" />
+<text  x="104.47" y="847.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (8 samples, 0.06%)</title><rect x="1174.4" y="293" width="0.7" height="15.0" fill="rgb(206,39,14)" rx="2" ry="2" />
+<text  x="1177.43" y="303.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (4 samples, 0.03%)</title><rect x="1181.1" y="501" width="0.4" height="15.0" fill="rgb(252,43,54)" rx="2" ry="2" />
+<text  x="1184.12" y="511.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (72 samples, 0.52%)</title><rect x="10.3" y="917" width="6.1" height="15.0" fill="rgb(246,161,40)" rx="2" ry="2" />
+<text  x="13.34" y="927.5" ></text>
+</g>
+<g >
+<title>object [Microsoft.Extensions.DependencyInjection.Abstractions] Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions::GetRequiredService (2 samples, 0.01%)</title><rect x="1178.4" y="517" width="0.2" height="15.0" fill="rgb(246,11,46)" rx="2" ry="2" />
+<text  x="1181.41" y="527.5" ></text>
+</g>
+<g >
+<title>netif_receive_skb (3 samples, 0.02%)</title><rect x="20.2" y="373" width="0.2" height="15.0" fill="rgb(226,58,9)" rx="2" ry="2" />
+<text  x="23.15" y="383.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker::Next (12,246 samples, 87.81%)</title><rect x="140.0" y="533" width="1036.2" height="15.0" fill="rgb(215,189,51)" rx="2" ry="2" />
+<text  x="143.05" y="543.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerAct..</text>
+</g>
+<g >
+<title>task_ctx_sched_out (2 samples, 0.01%)</title><rect x="103.2" y="805" width="0.1" height="15.0" fill="rgb(241,166,2)" rx="2" ry="2" />
+<text  x="106.16" y="815.5" ></text>
+</g>
+<g >
+<title>instance class [Microsoft.Extensions.DependencyInjection.Abstractions]Microsoft.Extensions.DependencyInjection.IServiceScope [Microsoft.Extensions.DependencyInjection] Microsoft.Extensions.DependencyInjection.ServiceLookup.ServiceProviderEngine::CreateScope (2 samples, 0.01%)</title><rect x="1176.3" y="533" width="0.2" height="15.0" fill="rgb(213,132,48)" rx="2" ry="2" />
+<text  x="1179.29" y="543.5" ></text>
+</g>
+<g >
+<title>syscall_trace_enter (5 samples, 0.04%)</title><rect x="140.4" y="197" width="0.4" height="15.0" fill="rgb(207,25,48)" rx="2" ry="2" />
+<text  x="143.39" y="207.5" ></text>
+</g>
+<g >
+<title>futex_wait (4 samples, 0.03%)</title><rect x="10.0" y="885" width="0.3" height="15.0" fill="rgb(219,86,51)" rx="2" ry="2" />
+<text  x="13.00" y="895.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1+AsyncStateMachineBox`1[System.Threading.Tasks.VoidTaskResult,Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal.SocketConnection+&lt;ProcessSends&gt;d__30]::MoveNext (3 samples, 0.02%)</title><rect x="138.0" y="789" width="0.3" height="15.0" fill="rgb(250,82,48)" rx="2" ry="2" />
+<text  x="141.02" y="799.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.ThreadPoolWorkQueue::EnsureThreadRequested (3 samples, 0.02%)</title><rect x="1179.9" y="805" width="0.3" height="15.0" fill="rgb(244,165,6)" rx="2" ry="2" />
+<text  x="1182.93" y="815.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ObjectResultExecutor::ExecuteAsync (20 samples, 0.14%)</title><rect x="1176.7" y="549" width="1.7" height="15.0" fill="rgb(206,125,46)" rx="2" ry="2" />
+<text  x="1179.72" y="559.5" ></text>
+</g>
+<g >
+<title>update_load_avg (2 samples, 0.01%)</title><rect x="32.3" y="789" width="0.2" height="15.0" fill="rgb(213,138,2)" rx="2" ry="2" />
+<text  x="35.34" y="799.5" ></text>
+</g>
+<g >
+<title>merge_sched_in (200 samples, 1.43%)</title><rect x="76.3" y="741" width="17.0" height="15.0" fill="rgb(233,142,36)" rx="2" ry="2" />
+<text  x="79.34" y="751.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpProtocol+&lt;ProcessRequests&gt;d__223`1[System.__Canon]::MoveNext (12,305 samples, 88.23%)</title><rect x="138.8" y="773" width="1041.1" height="15.0" fill="rgb(220,22,13)" rx="2" ry="2" />
+<text  x="141.78" y="783.5" >instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpProtocol+&lt;ProcessRequests&gt;d__..</text>
+</g>
+<g >
+<title>instance object [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Controllers.ControllerActivatorProvider+&lt;&gt;c__DisplayClass4_0::&lt;CreateActivator&gt;b__0 (3 samples, 0.02%)</title><rect x="1176.3" y="565" width="0.2" height="15.0" fill="rgb(235,227,47)" rx="2" ry="2" />
+<text  x="1179.29" y="575.5" ></text>
+</g>
+<g >
+<title>pick_next_task_fair (22 samples, 0.16%)</title><rect x="133.4" y="789" width="1.8" height="15.0" fill="rgb(205,192,46)" rx="2" ry="2" />
+<text  x="136.36" y="799.5" ></text>
+</g>
+<g >
+<title>sched_clock_cpu (8 samples, 0.06%)</title><rect x="116.4" y="757" width="0.7" height="15.0" fill="rgb(218,164,3)" rx="2" ry="2" />
+<text  x="119.44" y="767.5" ></text>
+</g>
+<g >
+<title>br_nf_pre_routing (3 samples, 0.02%)</title><rect x="20.2" y="469" width="0.2" height="15.0" fill="rgb(210,26,45)" rx="2" ry="2" />
+<text  x="23.15" y="479.5" ></text>
+</g>
+<g >
+<title>getrusage (3 samples, 0.02%)</title><rect x="123.1" y="837" width="0.3" height="15.0" fill="rgb(246,164,6)" rx="2" ry="2" />
+<text  x="126.13" y="847.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Formatters.TextOutputFormatter::WriteAsync (16 samples, 0.11%)</title><rect x="1176.7" y="533" width="1.4" height="15.0" fill="rgb(239,195,23)" rx="2" ry="2" />
+<text  x="1179.72" y="543.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (54 samples, 0.39%)</title><rect x="1182.6" y="837" width="4.5" height="15.0" fill="rgb(229,25,40)" rx="2" ry="2" />
+<text  x="1185.55" y="847.5" ></text>
+</g>
+<g >
+<title>fam_ops (4 samples, 0.03%)</title><rect x="140.5" y="149" width="0.3" height="15.0" fill="rgb(220,225,3)" rx="2" ry="2" />
+<text  x="143.47" y="159.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.Http1OutputProducer::WriteResponseHeadersInternal (4 samples, 0.03%)</title><rect x="1177.1" y="421" width="0.4" height="15.0" fill="rgb(227,130,24)" rx="2" ry="2" />
+<text  x="1180.14" y="431.5" ></text>
+</g>
+<g >
+<title>void [System.Private.CoreLib] System.Runtime.CompilerServices.AsyncMethodBuilderCore::Start (12,287 samples, 88.10%)</title><rect x="139.5" y="725" width="1039.6" height="15.0" fill="rgb(210,23,14)" rx="2" ry="2" />
+<text  x="142.46" y="735.5" >void [System.Private.CoreLib] System.Runtime.CompilerServices.AsyncMethodBuilderCore::Start</text>
+</g>
+<g >
+<title>ip_queue_xmit (5 samples, 0.04%)</title><rect x="20.0" y="757" width="0.4" height="15.0" fill="rgb(221,165,0)" rx="2" ry="2" />
+<text  x="22.98" y="767.5" ></text>
+</g>
+<g >
+<title>ep_poll (70 samples, 0.50%)</title><rect x="10.5" y="869" width="5.9" height="15.0" fill="rgb(231,150,30)" rx="2" ry="2" />
+<text  x="13.51" y="879.5" ></text>
+</g>
+<g >
+<title>instance bool [System.Net.Sockets] System.Net.Sockets.Socket::SendAsync (2 samples, 0.01%)</title><rect x="138.0" y="709" width="0.2" height="15.0" fill="rgb(247,1,0)" rx="2" ry="2" />
+<text  x="141.02" y="719.5" ></text>
+</g>
+<g >
+<title>asm_sysvec_call_function_single (4 samples, 0.03%)</title><rect x="1181.1" y="485" width="0.4" height="15.0" fill="rgb(237,182,10)" rx="2" ry="2" />
+<text  x="1184.12" y="495.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (16 samples, 0.11%)</title><rect x="1188.5" y="805" width="1.3" height="15.0" fill="rgb(210,161,2)" rx="2" ry="2" />
+<text  x="1191.48" y="815.5" ></text>
+</g>
+<g >
+<title>CorUnix::InternalWaitForMultipleObjectsEx (6 samples, 0.04%)</title><rect x="140.3" y="277" width="0.5" height="15.0" fill="rgb(209,31,25)" rx="2" ry="2" />
+<text  x="143.30" y="287.5" ></text>
+</g>
+<g >
+<title>pthread_cond_wait@@GLIBC_2.3.2 (247 samples, 1.77%)</title><rect x="102.0" y="965" width="20.9" height="15.0" fill="rgb(223,158,8)" rx="2" ry="2" />
+<text  x="104.97" y="975.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="17.1" y="917" width="0.2" height="15.0" fill="rgb(244,177,15)" rx="2" ry="2" />
+<text  x="20.11" y="927.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (3 samples, 0.02%)</title><rect x="123.1" y="885" width="0.3" height="15.0" fill="rgb(215,61,47)" rx="2" ry="2" />
+<text  x="126.13" y="895.5" ></text>
+</g>
+<g >
+<title>valuetype System.Diagnostics.ActivitySpanId [System.Diagnostics.DiagnosticSource] System.Diagnostics.ActivitySpanId::CreateRandom (2 samples, 0.01%)</title><rect x="139.3" y="693" width="0.2" height="15.0" fill="rgb(236,6,15)" rx="2" ry="2" />
+<text  x="142.29" y="703.5" ></text>
+</g>
+<g >
+<title>idtentry_exit_cond_rcu (24 samples, 0.17%)</title><rect x="1173.8" y="421" width="2.0" height="15.0" fill="rgb(231,5,26)" rx="2" ry="2" />
+<text  x="1176.75" y="431.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker::InvokeNextActionFilterAsync (12,246 samples, 87.81%)</title><rect x="140.0" y="549" width="1036.2" height="15.0" fill="rgb(250,202,47)" rx="2" ry="2" />
+<text  x="143.05" y="559.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerAct..</text>
+</g>
+<g >
+<title>do_syscall_64 (4 samples, 0.03%)</title><rect x="10.0" y="933" width="0.3" height="15.0" fill="rgb(214,13,27)" rx="2" ry="2" />
+<text  x="13.00" y="943.5" ></text>
+</g>
+<g >
+<title>instance bool [System.Private.CoreLib] System.Threading.Tasks.Task::TrySetResult (7 samples, 0.05%)</title><rect x="1181.0" y="725" width="0.6" height="15.0" fill="rgb(225,115,17)" rx="2" ry="2" />
+<text  x="1184.03" y="735.5" ></text>
+</g>
+<g >
+<title>futex_wake (5 samples, 0.04%)</title><rect x="1181.7" y="885" width="0.4" height="15.0" fill="rgb(254,170,10)" rx="2" ry="2" />
+<text  x="1184.71" y="895.5" ></text>
+</g>
+<g >
+<title>ip_finish_output (4 samples, 0.03%)</title><rect x="19.1" y="709" width="0.3" height="15.0" fill="rgb(220,186,46)" rx="2" ry="2" />
+<text  x="22.05" y="719.5" ></text>
+</g>
+<g >
+<title>futex_wait (878 samples, 6.30%)</title><rect x="27.5" y="885" width="74.3" height="15.0" fill="rgb(247,214,12)" rx="2" ry="2" />
+<text  x="30.51" y="895.5" >futex_wait</text>
+</g>
+<g >
+<title>start_thread (3 samples, 0.02%)</title><rect x="1188.1" y="965" width="0.3" height="15.0" fill="rgb(223,51,31)" rx="2" ry="2" />
+<text  x="1191.14" y="975.5" ></text>
+</g>
+<g >
+<title>net_rx_action (3 samples, 0.02%)</title><rect x="19.1" y="581" width="0.2" height="15.0" fill="rgb(215,179,49)" rx="2" ry="2" />
+<text  x="22.05" y="591.5" ></text>
+</g>
+<g >
+<title>futex_wait (8 samples, 0.06%)</title><rect x="1187.5" y="885" width="0.6" height="15.0" fill="rgb(219,60,45)" rx="2" ry="2" />
+<text  x="1190.46" y="895.5" ></text>
+</g>
+<g >
+<title>CLRLifoSemaphore::Wait (165 samples, 1.18%)</title><rect x="123.5" y="917" width="13.9" height="15.0" fill="rgb(231,63,33)" rx="2" ry="2" />
+<text  x="126.46" y="927.5" ></text>
+</g>
+<g >
+<title>SyncBlock::Wait (8 samples, 0.06%)</title><rect x="140.1" y="373" width="0.7" height="15.0" fill="rgb(210,67,26)" rx="2" ry="2" />
+<text  x="143.13" y="383.5" ></text>
+</g>
+<g >
+<title>__hrtimer_run_queues (6 samples, 0.04%)</title><rect x="1170.2" y="389" width="0.5" height="15.0" fill="rgb(245,57,17)" rx="2" ry="2" />
+<text  x="1173.20" y="399.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb (3 samples, 0.02%)</title><rect x="19.1" y="549" width="0.2" height="15.0" fill="rgb(244,190,5)" rx="2" ry="2" />
+<text  x="22.05" y="559.5" ></text>
+</g>
+<g >
+<title>__x64_sys_sendto (11 samples, 0.08%)</title><rect x="19.5" y="917" width="0.9" height="15.0" fill="rgb(229,19,29)" rx="2" ry="2" />
+<text  x="22.48" y="927.5" ></text>
+</g>
+<g >
+<title>delay_halt (2 samples, 0.01%)</title><rect x="31.3" y="693" width="0.2" height="15.0" fill="rgb(206,91,48)" rx="2" ry="2" />
+<text  x="34.32" y="703.5" ></text>
+</g>
+<g >
+<title>perf_event_update_time (16 samples, 0.11%)</title><rect x="118.5" y="709" width="1.3" height="15.0" fill="rgb(228,58,36)" rx="2" ry="2" />
+<text  x="121.47" y="719.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (56 samples, 0.40%)</title><rect x="11.4" y="741" width="4.8" height="15.0" fill="rgb(218,220,29)" rx="2" ry="2" />
+<text  x="14.44" y="751.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Formatters.StringOutputFormatter::WriteResponseBodyAsync (10 samples, 0.07%)</title><rect x="1177.0" y="517" width="0.8" height="15.0" fill="rgb(245,97,2)" rx="2" ry="2" />
+<text  x="1179.97" y="527.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ObjectResultExecutor::ExecuteAsyncCore (4 samples, 0.03%)</title><rect x="1178.1" y="533" width="0.3" height="15.0" fill="rgb(220,134,50)" rx="2" ry="2" />
+<text  x="1181.07" y="543.5" ></text>
+</g>
+<g >
+<title>native_queued_spin_lock_slowpath (4 samples, 0.03%)</title><rect x="95.0" y="757" width="0.3" height="15.0" fill="rgb(207,85,24)" rx="2" ry="2" />
+<text  x="97.95" y="767.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpProtocol::InitializeResponseAsync (5 samples, 0.04%)</title><rect x="1177.1" y="453" width="0.5" height="15.0" fill="rgb(220,153,44)" rx="2" ry="2" />
+<text  x="1180.14" y="463.5" ></text>
+</g>
+<g >
+<title>__libc_read (2 samples, 0.01%)</title><rect x="139.3" y="661" width="0.2" height="15.0" fill="rgb(250,127,35)" rx="2" ry="2" />
+<text  x="142.29" y="671.5" ></text>
+</g>
+<g >
+<title>inet6_sendmsg (10 samples, 0.07%)</title><rect x="19.6" y="869" width="0.8" height="15.0" fill="rgb(250,80,1)" rx="2" ry="2" />
+<text  x="22.56" y="879.5" ></text>
+</g>
+<g >
+<title>do_futex (8 samples, 0.06%)</title><rect x="1187.5" y="901" width="0.6" height="15.0" fill="rgb(236,209,25)" rx="2" ry="2" />
+<text  x="1190.46" y="911.5" ></text>
+</g>
+<g >
+<title>__ip_finish_output (4 samples, 0.03%)</title><rect x="19.1" y="693" width="0.3" height="15.0" fill="rgb(250,65,38)" rx="2" ry="2" />
+<text  x="22.05" y="703.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge.constprop.0 (68 samples, 0.49%)</title><rect x="117.1" y="757" width="5.8" height="15.0" fill="rgb(207,57,33)" rx="2" ry="2" />
+<text  x="120.12" y="767.5" ></text>
+</g>
+<g >
+<title>pthread_cond_timedwait@@GLIBC_2.3.2 (17 samples, 0.12%)</title><rect x="1188.4" y="965" width="1.4" height="15.0" fill="rgb(253,212,0)" rx="2" ry="2" />
+<text  x="1191.39" y="975.5" ></text>
+</g>
+<g >
+<title>hrtimer_interrupt (7 samples, 0.05%)</title><rect x="1170.2" y="405" width="0.6" height="15.0" fill="rgb(211,38,36)" rx="2" ry="2" />
+<text  x="1173.20" y="415.5" ></text>
+</g>
+<g >
+<title>sched_clock_cpu (4 samples, 0.03%)</title><rect x="1187.8" y="661" width="0.3" height="15.0" fill="rgb(230,108,33)" rx="2" ry="2" />
+<text  x="1190.80" y="671.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (35 samples, 0.25%)</title><rect x="132.9" y="805" width="2.9" height="15.0" fill="rgb(238,82,36)" rx="2" ry="2" />
+<text  x="135.86" y="815.5" ></text>
+</g>
+<g >
+<title>pthread_cond_signal@@GLIBC_2.3.2 (3 samples, 0.02%)</title><rect x="16.4" y="965" width="0.3" height="15.0" fill="rgb(205,19,21)" rx="2" ry="2" />
+<text  x="19.43" y="975.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvoker::InvokeFilterPipelineAsync (12,280 samples, 88.05%)</title><rect x="139.6" y="645" width="1039.1" height="15.0" fill="rgb(238,222,20)" rx="2" ry="2" />
+<text  x="142.63" y="655.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ResourceInvok..</text>
+</g>
+<g >
+<title>__remove_hrtimer (4 samples, 0.03%)</title><rect x="1187.1" y="837" width="0.4" height="15.0" fill="rgb(228,185,9)" rx="2" ry="2" />
+<text  x="1190.12" y="847.5" ></text>
+</g>
+<g >
+<title>__clone (8 samples, 0.06%)</title><rect x="17.4" y="949" width="0.7" height="15.0" fill="rgb(252,168,18)" rx="2" ry="2" />
+<text  x="20.45" y="959.5" ></text>
+</g>
+<g >
+<title>pthread_cond_timedwait@@GLIBC_2.3.2 (63 samples, 0.45%)</title><rect x="1182.1" y="965" width="5.4" height="15.0" fill="rgb(217,217,49)" rx="2" ry="2" />
+<text  x="1185.13" y="975.5" ></text>
+</g>
+<g >
+<title>SetEvent (2 samples, 0.01%)</title><rect x="1181.5" y="645" width="0.1" height="15.0" fill="rgb(246,83,27)" rx="2" ry="2" />
+<text  x="1184.45" y="655.5" ></text>
+</g>
+<g >
+<title>ThreadpoolMgr::SetAppDomainRequestsActive (3 samples, 0.02%)</title><rect x="16.8" y="741" width="0.2" height="15.0" fill="rgb(242,51,40)" rx="2" ry="2" />
+<text  x="19.77" y="751.5" ></text>
+</g>
+<g >
+<title>__prepare_exit_to_usermode (6 samples, 0.04%)</title><rect x="102.0" y="901" width="0.5" height="15.0" fill="rgb(243,47,15)" rx="2" ry="2" />
+<text  x="104.97" y="911.5" ></text>
+</g>
+<g >
+<title>start_thread (12,513 samples, 89.72%)</title><rect x="122.9" y="965" width="1058.7" height="15.0" fill="rgb(212,156,8)" rx="2" ry="2" />
+<text  x="125.87" y="975.5" >start_thread</text>
+</g>
+<g >
+<title>do_syscall_64 (5 samples, 0.04%)</title><rect x="20.9" y="933" width="0.4" height="15.0" fill="rgb(228,126,7)" rx="2" ry="2" />
+<text  x="23.91" y="943.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (6 samples, 0.04%)</title><rect x="140.3" y="229" width="0.5" height="15.0" fill="rgb(208,39,4)" rx="2" ry="2" />
+<text  x="143.30" y="239.5" ></text>
+</g>
+<g >
+<title>sk_stream_alloc_skb (2 samples, 0.01%)</title><rect x="19.6" y="821" width="0.2" height="15.0" fill="rgb(247,184,19)" rx="2" ry="2" />
+<text  x="22.65" y="831.5" ></text>
+</g>
+<g >
+<title>__secure_computing (9 samples, 0.06%)</title><rect x="136.3" y="837" width="0.8" height="15.0" fill="rgb(228,158,32)" rx="2" ry="2" />
+<text  x="139.33" y="847.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge.constprop.0 (4 samples, 0.03%)</title><rect x="1173.4" y="277" width="0.4" height="15.0" fill="rgb(235,84,2)" rx="2" ry="2" />
+<text  x="1176.42" y="287.5" ></text>
+</g>
+<g >
+<title>hrtimer_interrupt (4 samples, 0.03%)</title><rect x="20.6" y="901" width="0.3" height="15.0" fill="rgb(210,57,2)" rx="2" ry="2" />
+<text  x="23.58" y="911.5" ></text>
+</g>
+<g >
+<title>try_to_wake_up (3 samples, 0.02%)</title><rect x="1181.9" y="853" width="0.2" height="15.0" fill="rgb(222,43,18)" rx="2" ry="2" />
+<text  x="1184.88" y="863.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (63 samples, 0.45%)</title><rect x="1182.1" y="917" width="5.4" height="15.0" fill="rgb(240,180,45)" rx="2" ry="2" />
+<text  x="1185.13" y="927.5" ></text>
+</g>
+<g >
+<title>thread_group_cputime (3 samples, 0.02%)</title><rect x="123.1" y="805" width="0.3" height="15.0" fill="rgb(251,32,7)" rx="2" ry="2" />
+<text  x="126.13" y="815.5" ></text>
+</g>
+<g >
+<title>futex_wait (16 samples, 0.11%)</title><rect x="1188.5" y="885" width="1.3" height="15.0" fill="rgb(224,115,36)" rx="2" ry="2" />
+<text  x="1191.48" y="895.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets] Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal.SocketConnection+&lt;ProcessSends&gt;d__30::MoveNext (3 samples, 0.02%)</title><rect x="138.0" y="757" width="0.3" height="15.0" fill="rgb(235,169,42)" rx="2" ry="2" />
+<text  x="141.02" y="767.5" ></text>
+</g>
+<g >
+<title>SetEvent (4 samples, 0.03%)</title><rect x="1181.1" y="645" width="0.4" height="15.0" fill="rgb(210,142,20)" rx="2" ry="2" />
+<text  x="1184.12" y="655.5" ></text>
+</g>
+<g >
+<title>psi_task_change (2 samples, 0.01%)</title><rect x="96.2" y="821" width="0.2" height="15.0" fill="rgb(233,15,12)" rx="2" ry="2" />
+<text  x="99.22" y="831.5" ></text>
+</g>
+<g >
+<title>perf_event_update_userpage (28 samples, 0.20%)</title><rect x="13.1" y="661" width="2.4" height="15.0" fill="rgb(227,157,10)" rx="2" ry="2" />
+<text  x="16.13" y="671.5" ></text>
+</g>
+<g >
+<title>instance string [webapi] webapi.Controllers.WeatherForecastController::OnCPU (12,234 samples, 87.72%)</title><rect x="141.1" y="469" width="1035.1" height="15.0" fill="rgb(251,167,17)" rx="2" ry="2" />
+<text  x="144.06" y="479.5" >instance string [webapi] webapi.Controllers.WeatherForecastController::OnCPU</text>
+</g>
+<g >
+<title>__wake_up (3 samples, 0.02%)</title><rect x="20.2" y="69" width="0.2" height="15.0" fill="rgb(205,226,44)" rx="2" ry="2" />
+<text  x="23.15" y="79.5" ></text>
+</g>
+<g >
+<title>__sys_recvfrom (6 samples, 0.04%)</title><rect x="18.9" y="901" width="0.5" height="15.0" fill="rgb(210,199,17)" rx="2" ry="2" />
+<text  x="21.88" y="911.5" ></text>
+</g>
+<g >
+<title>vfs_read (2 samples, 0.01%)</title><rect x="139.3" y="581" width="0.2" height="15.0" fill="rgb(209,176,40)" rx="2" ry="2" />
+<text  x="142.29" y="591.5" ></text>
+</g>
+<g >
+<title>schedule (69 samples, 0.49%)</title><rect x="10.6" y="821" width="5.8" height="15.0" fill="rgb(240,215,31)" rx="2" ry="2" />
+<text  x="13.59" y="831.5" ></text>
+</g>
+<g >
+<title>do_futex (241 samples, 1.73%)</title><rect x="102.5" y="901" width="20.4" height="15.0" fill="rgb(211,119,42)" rx="2" ry="2" />
+<text  x="105.48" y="911.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_out (3 samples, 0.02%)</title><rect x="1170.8" y="341" width="0.2" height="15.0" fill="rgb(238,198,24)" rx="2" ry="2" />
+<text  x="1173.79" y="351.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (706 samples, 5.06%)</title><rect x="34.5" y="805" width="59.8" height="15.0" fill="rgb(217,7,10)" rx="2" ry="2" />
+<text  x="37.54" y="815.5" >__perf..</text>
+</g>
+<g >
+<title>amd_pmu_disable_all (4 samples, 0.03%)</title><rect x="1170.3" y="261" width="0.3" height="15.0" fill="rgb(234,224,2)" rx="2" ry="2" />
+<text  x="1173.29" y="271.5" ></text>
+</g>
+<g >
+<title>asm_call_sysvec_on_stack (5 samples, 0.04%)</title><rect x="94.3" y="773" width="0.4" height="15.0" fill="rgb(242,113,28)" rx="2" ry="2" />
+<text  x="97.27" y="783.5" ></text>
+</g>
+<g >
+<title>__secure_computing (2 samples, 0.01%)</title><rect x="101.8" y="901" width="0.2" height="15.0" fill="rgb(248,135,26)" rx="2" ry="2" />
+<text  x="104.80" y="911.5" ></text>
+</g>
+<g >
+<title>instance void [System.Diagnostics.DiagnosticSource] System.Diagnostics.Activity::GenerateW3CId (2 samples, 0.01%)</title><rect x="139.3" y="709" width="0.2" height="15.0" fill="rgb(210,135,20)" rx="2" ry="2" />
+<text  x="142.29" y="719.5" ></text>
+</g>
+<g >
+<title>x86_pmu_disable (2 samples, 0.01%)</title><rect x="133.1" y="725" width="0.2" height="15.0" fill="rgb(246,78,17)" rx="2" ry="2" />
+<text  x="136.11" y="735.5" ></text>
+</g>
+<g >
+<title>tcp_push (7 samples, 0.05%)</title><rect x="19.8" y="821" width="0.6" height="15.0" fill="rgb(236,153,35)" rx="2" ry="2" />
+<text  x="22.82" y="831.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (12 samples, 0.09%)</title><rect x="129.4" y="837" width="1.0" height="15.0" fill="rgb(235,37,48)" rx="2" ry="2" />
+<text  x="132.39" y="847.5" ></text>
+</g>
+<g >
+<title>ep_poll_callback (3 samples, 0.02%)</title><rect x="20.2" y="85" width="0.2" height="15.0" fill="rgb(253,58,49)" rx="2" ry="2" />
+<text  x="23.15" y="95.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (20 samples, 0.14%)</title><rect x="1171.0" y="325" width="1.7" height="15.0" fill="rgb(214,220,53)" rx="2" ry="2" />
+<text  x="1174.05" y="335.5" ></text>
+</g>
+<g >
+<title>native_sched_clock (4 samples, 0.03%)</title><rect x="1187.8" y="645" width="0.3" height="15.0" fill="rgb(225,185,50)" rx="2" ry="2" />
+<text  x="1190.80" y="655.5" ></text>
+</g>
+<g >
+<title>merge_sched_in (36 samples, 0.26%)</title><rect x="13.1" y="709" width="3.1" height="15.0" fill="rgb(249,179,20)" rx="2" ry="2" />
+<text  x="16.13" y="719.5" ></text>
+</g>
+<g >
+<title>update_curr (11 samples, 0.08%)</title><rect x="134.2" y="773" width="0.9" height="15.0" fill="rgb(241,95,18)" rx="2" ry="2" />
+<text  x="137.21" y="783.5" ></text>
+</g>
+<g >
+<title>CallDescrWorkerInternal (12,324 samples, 88.37%)</title><rect x="137.4" y="837" width="1042.8" height="15.0" fill="rgb(254,89,18)" rx="2" ry="2" />
+<text  x="140.43" y="847.5" >CallDescrWorkerInternal</text>
+</g>
+<g >
+<title>__wake_up_common_lock (3 samples, 0.02%)</title><rect x="20.2" y="53" width="0.2" height="15.0" fill="rgb(208,45,46)" rx="2" ry="2" />
+<text  x="23.15" y="63.5" ></text>
+</g>
+<g >
+<title>__cgroup_account_cputime (2 samples, 0.01%)</title><rect x="134.8" y="757" width="0.2" height="15.0" fill="rgb(225,114,14)" rx="2" ry="2" />
+<text  x="137.80" y="767.5" ></text>
+</g>
+<g >
+<title>ip_queue_xmit (4 samples, 0.03%)</title><rect x="19.1" y="773" width="0.3" height="15.0" fill="rgb(232,134,2)" rx="2" ry="2" />
+<text  x="22.05" y="783.5" ></text>
+</g>
+<g >
+<title>__tcp_transmit_skb (4 samples, 0.03%)</title><rect x="19.1" y="789" width="0.3" height="15.0" fill="rgb(221,84,45)" rx="2" ry="2" />
+<text  x="22.05" y="799.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (20 samples, 0.14%)</title><rect x="11.4" y="725" width="1.7" height="15.0" fill="rgb(244,63,2)" rx="2" ry="2" />
+<text  x="14.44" y="735.5" ></text>
+</g>
+<g >
+<title>nf_conntrack_in (2 samples, 0.01%)</title><rect x="19.1" y="437" width="0.2" height="15.0" fill="rgb(213,79,5)" rx="2" ry="2" />
+<text  x="22.14" y="447.5" ></text>
+</g>
+<g >
+<title>schedule (36 samples, 0.26%)</title><rect x="132.8" y="821" width="3.0" height="15.0" fill="rgb(236,148,4)" rx="2" ry="2" />
+<text  x="135.77" y="831.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (4 samples, 0.03%)</title><rect x="1181.1" y="581" width="0.4" height="15.0" fill="rgb(245,80,7)" rx="2" ry="2" />
+<text  x="1184.12" y="591.5" ></text>
+</g>
+<g >
+<title>__remove_hrtimer (29 samples, 0.21%)</title><rect x="98.0" y="837" width="2.5" height="15.0" fill="rgb(240,2,41)" rx="2" ry="2" />
+<text  x="101.00" y="847.5" ></text>
+</g>
+<g >
+<title>ThreadNative::KickOffThread_Worker (2 samples, 0.01%)</title><rect x="1189.8" y="885" width="0.2" height="15.0" fill="rgb(251,208,4)" rx="2" ry="2" />
+<text  x="1192.83" y="895.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (16 samples, 0.11%)</title><rect x="1188.5" y="789" width="1.3" height="15.0" fill="rgb(231,38,4)" rx="2" ry="2" />
+<text  x="1191.48" y="799.5" ></text>
+</g>
+<g >
+<title>update_rq_clock (6 samples, 0.04%)</title><rect x="135.3" y="789" width="0.5" height="15.0" fill="rgb(220,78,22)" rx="2" ry="2" />
+<text  x="138.31" y="799.5" ></text>
+</g>
+<g >
+<title>instance void [System.Net.Sockets] System.Net.Sockets.SocketAsyncEngine::EventLoop (5 samples, 0.04%)</title><rect x="16.7" y="821" width="0.4" height="15.0" fill="rgb(246,3,21)" rx="2" ry="2" />
+<text  x="19.68" y="831.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (13 samples, 0.09%)</title><rect x="19.5" y="933" width="1.1" height="15.0" fill="rgb(235,181,24)" rx="2" ry="2" />
+<text  x="22.48" y="943.5" ></text>
+</g>
+<g >
+<title>nf_hook_slow (2 samples, 0.01%)</title><rect x="19.1" y="469" width="0.2" height="15.0" fill="rgb(213,115,38)" rx="2" ry="2" />
+<text  x="22.14" y="479.5" ></text>
+</g>
+<g >
+<title>instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;valuetype [System.IO.Pipelines]System.IO.Pipelines.FlushResult&gt; [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpProtocol::FlushPipeAsync (3 samples, 0.02%)</title><rect x="1177.6" y="469" width="0.2" height="15.0" fill="rgb(207,25,1)" rx="2" ry="2" />
+<text  x="1180.56" y="479.5" ></text>
+</g>
+<g >
+<title>ObjHeader::PulseAll (2 samples, 0.01%)</title><rect x="1181.5" y="661" width="0.1" height="15.0" fill="rgb(207,28,51)" rx="2" ry="2" />
+<text  x="1184.45" y="671.5" ></text>
+</g>
+<g >
+<title>SVR::gc_heap::try_allocate_more_space (2 samples, 0.01%)</title><rect x="1176.3" y="469" width="0.2" height="15.0" fill="rgb(226,77,45)" rx="2" ry="2" />
+<text  x="1179.29" y="479.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (65 samples, 0.47%)</title><rect x="131.6" y="885" width="5.5" height="15.0" fill="rgb(244,63,23)" rx="2" ry="2" />
+<text  x="134.59" y="895.5" ></text>
+</g>
+<g >
+<title>fam_ops (4 samples, 0.03%)</title><rect x="21.0" y="885" width="0.3" height="15.0" fill="rgb(240,160,29)" rx="2" ry="2" />
+<text  x="24.00" y="895.5" ></text>
+</g>
+<g >
+<title>extract_crng (2 samples, 0.01%)</title><rect x="139.3" y="533" width="0.2" height="15.0" fill="rgb(246,3,28)" rx="2" ry="2" />
+<text  x="142.29" y="543.5" ></text>
+</g>
+<g >
+<title>dequeue_entity (2 samples, 0.01%)</title><rect x="32.3" y="805" width="0.2" height="15.0" fill="rgb(222,6,14)" rx="2" ry="2" />
+<text  x="35.34" y="815.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker::InvokeNextActionFilterAsync (12,248 samples, 87.82%)</title><rect x="140.0" y="581" width="1036.3" height="15.0" fill="rgb(222,167,7)" rx="2" ry="2" />
+<text  x="142.96" y="591.5" >instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.ControllerAct..</text>
+</g>
+<g >
+<title>syscall_trace_enter (2 samples, 0.01%)</title><rect x="20.4" y="917" width="0.2" height="15.0" fill="rgb(210,158,46)" rx="2" ry="2" />
+<text  x="23.41" y="927.5" ></text>
+</g>
+<g >
+<title>schedule (16 samples, 0.11%)</title><rect x="1188.5" y="853" width="1.3" height="15.0" fill="rgb(250,34,45)" rx="2" ry="2" />
+<text  x="1191.48" y="863.5" ></text>
+</g>
+<g >
+<title>perf_pmu_nop_txn (4 samples, 0.03%)</title><rect x="93.9" y="741" width="0.4" height="15.0" fill="rgb(211,26,27)" rx="2" ry="2" />
+<text  x="96.94" y="751.5" ></text>
+</g>
+<g >
+<title>perf_event_task_tick (4 samples, 0.03%)</title><rect x="1170.3" y="309" width="0.3" height="15.0" fill="rgb(231,61,22)" rx="2" ry="2" />
+<text  x="1173.29" y="319.5" ></text>
+</g>
+<g >
+<title>merge_sched_in (4 samples, 0.03%)</title><rect x="1186.0" y="741" width="0.4" height="15.0" fill="rgb(219,218,4)" rx="2" ry="2" />
+<text  x="1189.02" y="751.5" ></text>
+</g>
+<g >
+<title>Kestrel_Timer (19 samples, 0.14%)</title><rect x="1188.4" y="981" width="1.6" height="15.0" fill="rgb(251,223,0)" rx="2" ry="2" />
+<text  x="1191.39" y="991.5" ></text>
+</g>
+<g >
+<title>wake_up_q (2 samples, 0.01%)</title><rect x="16.5" y="869" width="0.2" height="15.0" fill="rgb(224,93,34)" rx="2" ry="2" />
+<text  x="19.52" y="879.5" ></text>
+</g>
+<g >
+<title>[perf-1.map] (2 samples, 0.01%)</title><rect x="139.5" y="677" width="0.1" height="15.0" fill="rgb(247,34,54)" rx="2" ry="2" />
+<text  x="142.46" y="687.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.Tasks.Task+DelayPromise::CompleteTimedOut (7 samples, 0.05%)</title><rect x="1181.0" y="741" width="0.6" height="15.0" fill="rgb(220,115,4)" rx="2" ry="2" />
+<text  x="1184.03" y="751.5" ></text>
+</g>
+<g >
+<title>merge_sched_in (64 samples, 0.46%)</title><rect x="117.1" y="741" width="5.4" height="15.0" fill="rgb(236,49,51)" rx="2" ry="2" />
+<text  x="120.12" y="751.5" ></text>
+</g>
+<g >
+<title>ipv4_conntrack_in (2 samples, 0.01%)</title><rect x="19.1" y="453" width="0.2" height="15.0" fill="rgb(215,135,43)" rx="2" ry="2" />
+<text  x="22.14" y="463.5" ></text>
+</g>
+<g >
+<title>perf_event_update_time (28 samples, 0.20%)</title><rect x="82.8" y="709" width="2.3" height="15.0" fill="rgb(208,192,48)" rx="2" ry="2" />
+<text  x="85.77" y="719.5" ></text>
+</g>
+<g >
+<title>ThreadpoolMgr::AsyncTimerCallbackCompletion (7 samples, 0.05%)</title><rect x="1181.0" y="901" width="0.6" height="15.0" fill="rgb(243,226,38)" rx="2" ry="2" />
+<text  x="1184.03" y="911.5" ></text>
+</g>
+<g >
+<title>Thread::DoAppropriateWait (7 samples, 0.05%)</title><rect x="140.2" y="325" width="0.6" height="15.0" fill="rgb(231,7,36)" rx="2" ry="2" />
+<text  x="143.22" y="335.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (12 samples, 0.09%)</title><rect x="1172.7" y="325" width="1.1" height="15.0" fill="rgb(241,73,0)" rx="2" ry="2" />
+<text  x="1175.74" y="335.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (5 samples, 0.04%)</title><rect x="1181.7" y="949" width="0.4" height="15.0" fill="rgb(242,37,1)" rx="2" ry="2" />
+<text  x="1184.71" y="959.5" ></text>
+</g>
+<g >
+<title>[libc-2.28.so] (2 samples, 0.01%)</title><rect x="1176.3" y="405" width="0.2" height="15.0" fill="rgb(210,17,30)" rx="2" ry="2" />
+<text  x="1179.29" y="415.5" ></text>
+</g>
+<g >
+<title>clear_buddies (4 samples, 0.03%)</title><rect x="133.7" y="773" width="0.3" height="15.0" fill="rgb(247,162,10)" rx="2" ry="2" />
+<text  x="136.70" y="783.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (3 samples, 0.02%)</title><rect x="123.1" y="901" width="0.3" height="15.0" fill="rgb(214,70,2)" rx="2" ry="2" />
+<text  x="126.13" y="911.5" ></text>
+</g>
+<g >
+<title>calc_timer_values (12 samples, 0.09%)</title><rect x="90.2" y="677" width="1.0" height="15.0" fill="rgb(250,65,45)" rx="2" ry="2" />
+<text  x="93.21" y="687.5" ></text>
+</g>
+<g >
+<title>SVR::gc_heap::allocate_soh (2 samples, 0.01%)</title><rect x="1176.3" y="453" width="0.2" height="15.0" fill="rgb(236,130,21)" rx="2" ry="2" />
+<text  x="1179.29" y="463.5" ></text>
+</g>
+<g >
+<title>__seccomp_filter (6 samples, 0.04%)</title><rect x="129.9" y="773" width="0.5" height="15.0" fill="rgb(220,95,44)" rx="2" ry="2" />
+<text  x="132.90" y="783.5" ></text>
+</g>
+<g >
+<title>instance class [Microsoft.AspNetCore.Mvc.Abstractions]Microsoft.AspNetCore.Mvc.Formatters.IOutputFormatter [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Infrastructure.DefaultOutputFormatterSelector::SelectFormatter (4 samples, 0.03%)</title><rect x="1178.1" y="517" width="0.3" height="15.0" fill="rgb(207,0,0)" rx="2" ry="2" />
+<text  x="1181.07" y="527.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (56 samples, 0.40%)</title><rect x="11.4" y="757" width="4.8" height="15.0" fill="rgb(219,144,0)" rx="2" ry="2" />
+<text  x="14.44" y="767.5" ></text>
+</g>
+<g >
+<title>ThreadpoolMgr::SetAppDomainRequestsActive (2 samples, 0.01%)</title><rect x="1180.0" y="773" width="0.2" height="15.0" fill="rgb(254,6,10)" rx="2" ry="2" />
+<text  x="1183.02" y="783.5" ></text>
+</g>
+<g >
+<title>__const_udelay (3 samples, 0.02%)</title><rect x="31.2" y="709" width="0.3" height="15.0" fill="rgb(211,211,23)" rx="2" ry="2" />
+<text  x="34.24" y="719.5" ></text>
+</g>
+<g >
+<title>load_balance (2 samples, 0.01%)</title><rect x="1186.8" y="789" width="0.2" height="15.0" fill="rgb(230,24,46)" rx="2" ry="2" />
+<text  x="1189.78" y="799.5" ></text>
+</g>
+<g >
+<title>ThreadNative::KickOffThread_Worker (5 samples, 0.04%)</title><rect x="16.7" y="885" width="0.4" height="15.0" fill="rgb(219,116,26)" rx="2" ry="2" />
+<text  x="19.68" y="895.5" ></text>
+</g>
+<g >
+<title>perf_pmu_nop_int (4 samples, 0.03%)</title><rect x="122.5" y="741" width="0.4" height="15.0" fill="rgb(222,198,51)" rx="2" ry="2" />
+<text  x="125.53" y="751.5" ></text>
+</g>
+<g >
+<title>ManagedThreadBase_DispatchOuter (2 samples, 0.01%)</title><rect x="1189.8" y="901" width="0.2" height="15.0" fill="rgb(220,184,25)" rx="2" ry="2" />
+<text  x="1192.83" y="911.5" ></text>
+</g>
+<g >
+<title>futex_wake (13 samples, 0.09%)</title><rect x="22.0" y="885" width="1.1" height="15.0" fill="rgb(245,209,6)" rx="2" ry="2" />
+<text  x="25.01" y="895.5" ></text>
+</g>
+<g >
+<title>.NET_Finalizer (4 samples, 0.03%)</title><rect x="10.0" y="981" width="0.3" height="15.0" fill="rgb(232,142,27)" rx="2" ry="2" />
+<text  x="13.00" y="991.5" ></text>
+</g>
+<g >
+<title>ttwu_queue_wakelist (2 samples, 0.01%)</title><rect x="22.9" y="837" width="0.1" height="15.0" fill="rgb(208,64,28)" rx="2" ry="2" />
+<text  x="25.86" y="847.5" ></text>
+</g>
+<g >
+<title>perf_event_update_userpage (4 samples, 0.03%)</title><rect x="85.1" y="709" width="0.4" height="15.0" fill="rgb(244,11,28)" rx="2" ry="2" />
+<text  x="88.14" y="719.5" ></text>
+</g>
+<g >
+<title>instance bool [System.Private.CoreLib] System.Threading.Tasks.Task::SpinWait (2 samples, 0.01%)</title><rect x="140.8" y="405" width="0.2" height="15.0" fill="rgb(251,148,3)" rx="2" ry="2" />
+<text  x="143.81" y="415.5" ></text>
+</g>
+<g >
+<title>asm_sysvec_apic_timer_interrupt (4 samples, 0.03%)</title><rect x="20.6" y="949" width="0.3" height="15.0" fill="rgb(207,58,52)" rx="2" ry="2" />
+<text  x="23.58" y="959.5" ></text>
+</g>
+<g >
+<title>sched_clock_cpu (8 samples, 0.06%)</title><rect x="90.6" y="661" width="0.6" height="15.0" fill="rgb(214,200,48)" rx="2" ry="2" />
+<text  x="93.55" y="671.5" ></text>
+</g>
+<g >
+<title>wake_up_q (3 samples, 0.02%)</title><rect x="1181.9" y="869" width="0.2" height="15.0" fill="rgb(230,75,50)" rx="2" ry="2" />
+<text  x="1184.88" y="879.5" ></text>
+</g>
+<g >
+<title>do_futex (63 samples, 0.45%)</title><rect x="1182.1" y="901" width="5.4" height="15.0" fill="rgb(220,12,42)" rx="2" ry="2" />
+<text  x="1185.13" y="911.5" ></text>
+</g>
+<g >
+<title>pthread_cond_wait@@GLIBC_2.3.2 (8 samples, 0.06%)</title><rect x="1187.5" y="965" width="0.6" height="15.0" fill="rgb(238,117,10)" rx="2" ry="2" />
+<text  x="1190.46" y="975.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (8 samples, 0.06%)</title><rect x="121.9" y="725" width="0.6" height="15.0" fill="rgb(253,0,22)" rx="2" ry="2" />
+<text  x="124.86" y="735.5" ></text>
+</g>
+<g >
+<title>dequeue_task_fair (2 samples, 0.01%)</title><rect x="32.3" y="821" width="0.2" height="15.0" fill="rgb(208,187,36)" rx="2" ry="2" />
+<text  x="35.34" y="831.5" ></text>
+</g>
+<g >
+<title>try_to_wake_up (2 samples, 0.01%)</title><rect x="16.5" y="853" width="0.2" height="15.0" fill="rgb(223,190,13)" rx="2" ry="2" />
+<text  x="19.52" y="863.5" ></text>
+</g>
+<g >
+<title>rb_next (45 samples, 0.32%)</title><rect x="71.2" y="757" width="3.8" height="15.0" fill="rgb(253,17,9)" rx="2" ry="2" />
+<text  x="74.17" y="767.5" ></text>
+</g>
+<g >
+<title>asm_sysvec_apic_timer_interrupt (5 samples, 0.04%)</title><rect x="94.3" y="805" width="0.4" height="15.0" fill="rgb(248,24,9)" rx="2" ry="2" />
+<text  x="97.27" y="815.5" ></text>
+</g>
+<g >
+<title>__prepare_exit_to_usermode (23 samples, 0.16%)</title><rect x="1170.8" y="389" width="1.9" height="15.0" fill="rgb(253,22,35)" rx="2" ry="2" />
+<text  x="1173.79" y="399.5" ></text>
+</g>
+<g >
+<title>__pthread_getspecific (2 samples, 0.01%)</title><rect x="131.0" y="901" width="0.2" height="15.0" fill="rgb(246,146,51)" rx="2" ry="2" />
+<text  x="134.00" y="911.5" ></text>
+</g>
+<g >
+<title>native_sched_clock (5 samples, 0.04%)</title><rect x="135.4" y="757" width="0.4" height="15.0" fill="rgb(227,91,14)" rx="2" ry="2" />
+<text  x="138.40" y="767.5" ></text>
+</g>
+<g >
+<title>ip_rcv (3 samples, 0.02%)</title><rect x="20.2" y="325" width="0.2" height="15.0" fill="rgb(209,100,29)" rx="2" ry="2" />
+<text  x="23.15" y="335.5" ></text>
+</g>
+<g >
+<title>error_return (4 samples, 0.03%)</title><rect x="1175.8" y="453" width="0.3" height="15.0" fill="rgb(242,114,2)" rx="2" ry="2" />
+<text  x="1178.79" y="463.5" ></text>
+</g>
+<g >
+<title>.NET_Timer (80 samples, 0.57%)</title><rect x="1181.6" y="981" width="6.8" height="15.0" fill="rgb(219,178,18)" rx="2" ry="2" />
+<text  x="1184.62" y="991.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.ThreadPoolWorkQueue::Enqueue (4 samples, 0.03%)</title><rect x="16.7" y="789" width="0.3" height="15.0" fill="rgb(208,136,46)" rx="2" ry="2" />
+<text  x="19.68" y="799.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1+AsyncStateMachineBox`1[System.Threading.Tasks.VoidTaskResult,Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal.SocketConnection+&lt;ProcessReceives&gt;d__28]::MoveNext (5 samples, 0.04%)</title><rect x="138.4" y="789" width="0.4" height="15.0" fill="rgb(226,2,53)" rx="2" ry="2" />
+<text  x="141.36" y="799.5" ></text>
+</g>
+<g >
+<title>nf_hook_slow (3 samples, 0.02%)</title><rect x="20.2" y="309" width="0.2" height="15.0" fill="rgb(213,70,12)" rx="2" ry="2" />
+<text  x="23.15" y="319.5" ></text>
+</g>
+<g >
+<title>native_sched_clock (8 samples, 0.06%)</title><rect x="116.4" y="741" width="0.7" height="15.0" fill="rgb(227,23,31)" rx="2" ry="2" />
+<text  x="119.44" y="751.5" ></text>
+</g>
+<g >
+<title>fam_ops (5 samples, 0.04%)</title><rect x="130.0" y="757" width="0.4" height="15.0" fill="rgb(213,177,43)" rx="2" ry="2" />
+<text  x="132.98" y="767.5" ></text>
+</g>
+<g >
+<title>__softirqentry_text_start (4 samples, 0.03%)</title><rect x="20.1" y="581" width="0.3" height="15.0" fill="rgb(220,136,9)" rx="2" ry="2" />
+<text  x="23.07" y="591.5" ></text>
+</g>
+<g >
+<title>JIT_MonExit_Portable (4 samples, 0.03%)</title><rect x="1181.1" y="677" width="0.4" height="15.0" fill="rgb(233,76,25)" rx="2" ry="2" />
+<text  x="1184.12" y="687.5" ></text>
+</g>
+<g >
+<title>select_task_rq_fair (2 samples, 0.01%)</title><rect x="22.4" y="837" width="0.1" height="15.0" fill="rgb(232,172,3)" rx="2" ry="2" />
+<text  x="25.35" y="847.5" ></text>
+</g>
+<g >
+<title>CorUnix::CSynchControllerBase::Release (4 samples, 0.03%)</title><rect x="1181.1" y="629" width="0.4" height="15.0" fill="rgb(249,124,36)" rx="2" ry="2" />
+<text  x="1184.12" y="639.5" ></text>
+</g>
+<g >
+<title>perf_pmu_disable.part.0 (8 samples, 0.06%)</title><rect x="31.2" y="773" width="0.7" height="15.0" fill="rgb(249,128,10)" rx="2" ry="2" />
+<text  x="34.24" y="783.5" ></text>
+</g>
+<g >
+<title>merge_sched_in (4 samples, 0.03%)</title><rect x="1172.4" y="261" width="0.3" height="15.0" fill="rgb(208,69,0)" rx="2" ry="2" />
+<text  x="1175.40" y="271.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (12 samples, 0.09%)</title><rect x="1172.7" y="293" width="1.1" height="15.0" fill="rgb(253,148,16)" rx="2" ry="2" />
+<text  x="1175.74" y="303.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (913 samples, 6.55%)</title><rect x="24.7" y="949" width="77.3" height="15.0" fill="rgb(218,98,26)" rx="2" ry="2" />
+<text  x="27.72" y="959.5" >entry_SY..</text>
+</g>
+<g >
+<title>__update_idle_core (3 samples, 0.02%)</title><rect x="96.0" y="789" width="0.2" height="15.0" fill="rgb(247,16,51)" rx="2" ry="2" />
+<text  x="98.97" y="799.5" ></text>
+</g>
+<g >
+<title>ReleaseSemaphore (2 samples, 0.01%)</title><rect x="16.9" y="693" width="0.1" height="15.0" fill="rgb(207,176,53)" rx="2" ry="2" />
+<text  x="19.85" y="703.5" ></text>
+</g>
+<g >
+<title>amd_pmu_disable_all (3 samples, 0.02%)</title><rect x="1170.8" y="261" width="0.2" height="15.0" fill="rgb(216,148,30)" rx="2" ry="2" />
+<text  x="1173.79" y="271.5" ></text>
+</g>
+<g >
+<title>tcp_cleanup_rbuf (5 samples, 0.04%)</title><rect x="19.0" y="837" width="0.4" height="15.0" fill="rgb(228,195,28)" rx="2" ry="2" />
+<text  x="21.97" y="847.5" ></text>
+</g>
+<g >
+<title>schedule_hrtimeout_range (69 samples, 0.49%)</title><rect x="10.6" y="853" width="5.8" height="15.0" fill="rgb(215,216,15)" rx="2" ry="2" />
+<text  x="13.59" y="863.5" ></text>
+</g>
+<g >
+<title>asm_call_sysvec_on_stack (4 samples, 0.03%)</title><rect x="20.1" y="597" width="0.3" height="15.0" fill="rgb(230,66,4)" rx="2" ry="2" />
+<text  x="23.07" y="607.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalSynchronizationManager::BlockThread (6 samples, 0.04%)</title><rect x="140.3" y="261" width="0.5" height="15.0" fill="rgb(225,218,22)" rx="2" ry="2" />
+<text  x="143.30" y="271.5" ></text>
+</g>
+<g >
+<title>perf_pmu_nop_int (4 samples, 0.03%)</title><rect x="1186.4" y="741" width="0.3" height="15.0" fill="rgb(205,59,19)" rx="2" ry="2" />
+<text  x="1189.36" y="751.5" ></text>
+</g>
+<g >
+<title>instance bool [System.Private.CoreLib] System.Threading.Tasks.Task::SpinThenBlockingWait (10 samples, 0.07%)</title><rect x="140.1" y="421" width="0.9" height="15.0" fill="rgb(235,84,9)" rx="2" ry="2" />
+<text  x="143.13" y="431.5" ></text>
+</g>
+<g >
+<title>perf_pmu_disable.part.0 (3 samples, 0.02%)</title><rect x="1170.8" y="293" width="0.2" height="15.0" fill="rgb(225,105,14)" rx="2" ry="2" />
+<text  x="1173.79" y="303.5" ></text>
+</g>
+<g >
+<title>instance void [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpResponseHeaders::CopyTo (3 samples, 0.02%)</title><rect x="1177.2" y="405" width="0.3" height="15.0" fill="rgb(210,62,50)" rx="2" ry="2" />
+<text  x="1180.22" y="415.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (8 samples, 0.06%)</title><rect x="1174.4" y="357" width="0.7" height="15.0" fill="rgb(228,101,23)" rx="2" ry="2" />
+<text  x="1177.43" y="367.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (782 samples, 5.61%)</title><rect x="30.3" y="837" width="66.2" height="15.0" fill="rgb(232,153,53)" rx="2" ry="2" />
+<text  x="33.31" y="847.5" >__sched..</text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (247 samples, 1.77%)</title><rect x="102.0" y="949" width="20.9" height="15.0" fill="rgb(231,183,19)" rx="2" ry="2" />
+<text  x="104.97" y="959.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64 (4 samples, 0.03%)</title><rect x="131.2" y="885" width="0.4" height="15.0" fill="rgb(224,181,16)" rx="2" ry="2" />
+<text  x="134.25" y="895.5" ></text>
+</g>
+<g >
+<title>hrtimer_try_to_cancel (4 samples, 0.03%)</title><rect x="1187.1" y="853" width="0.4" height="15.0" fill="rgb(248,85,49)" rx="2" ry="2" />
+<text  x="1190.12" y="863.5" ></text>
+</g>
+<g >
+<title>schedule (23 samples, 0.16%)</title><rect x="1170.8" y="373" width="1.9" height="15.0" fill="rgb(222,188,28)" rx="2" ry="2" />
+<text  x="1173.79" y="383.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (228 samples, 1.63%)</title><rect x="103.6" y="805" width="19.3" height="15.0" fill="rgb(205,165,17)" rx="2" ry="2" />
+<text  x="106.58" y="815.5" ></text>
+</g>
+<g >
+<title>calculate_sigpending (4 samples, 0.03%)</title><rect x="17.4" y="901" width="0.4" height="15.0" fill="rgb(248,202,37)" rx="2" ry="2" />
+<text  x="20.45" y="911.5" ></text>
+</g>
+<g >
+<title>ThreadpoolMgr::MaybeAddWorkingWorker (2 samples, 0.01%)</title><rect x="16.9" y="709" width="0.1" height="15.0" fill="rgb(236,37,15)" rx="2" ry="2" />
+<text  x="19.85" y="719.5" ></text>
+</g>
+<g >
+<title>schedule (8 samples, 0.06%)</title><rect x="1174.4" y="373" width="0.7" height="15.0" fill="rgb(219,103,41)" rx="2" ry="2" />
+<text  x="1177.43" y="383.5" ></text>
+</g>
+<g >
+<title>asm_sysvec_apic_timer_interrupt (4 samples, 0.03%)</title><rect x="32.0" y="821" width="0.3" height="15.0" fill="rgb(243,144,38)" rx="2" ry="2" />
+<text  x="35.00" y="831.5" ></text>
+</g>
+<g >
+<title>pthread_cond_signal@@GLIBC_2.3.2 (5 samples, 0.04%)</title><rect x="1181.7" y="965" width="0.4" height="15.0" fill="rgb(215,189,11)" rx="2" ry="2" />
+<text  x="1184.71" y="975.5" ></text>
+</g>
+<g >
+<title>instance void [System.Private.CoreLib] System.Threading.SpinWait::SpinOnceCore (2 samples, 0.01%)</title><rect x="140.8" y="389" width="0.2" height="15.0" fill="rgb(246,44,49)" rx="2" ry="2" />
+<text  x="143.81" y="399.5" ></text>
+</g>
+<g >
+<title>futex_wake (2 samples, 0.01%)</title><rect x="16.5" y="885" width="0.2" height="15.0" fill="rgb(206,215,46)" rx="2" ry="2" />
+<text  x="19.52" y="895.5" ></text>
+</g>
+<g >
+<title>process_backlog (4 samples, 0.03%)</title><rect x="20.1" y="549" width="0.3" height="15.0" fill="rgb(250,130,46)" rx="2" ry="2" />
+<text  x="23.07" y="559.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (8 samples, 0.06%)</title><rect x="1187.5" y="821" width="0.6" height="15.0" fill="rgb(241,221,46)" rx="2" ry="2" />
+<text  x="1190.46" y="831.5" ></text>
+</g>
+<g >
+<title>tcp_recvmsg (6 samples, 0.04%)</title><rect x="18.9" y="853" width="0.5" height="15.0" fill="rgb(238,14,51)" rx="2" ry="2" />
+<text  x="21.88" y="863.5" ></text>
+</g>
+<g >
+<title>find_busiest_group (5 samples, 0.04%)</title><rect x="95.3" y="773" width="0.4" height="15.0" fill="rgb(244,208,5)" rx="2" ry="2" />
+<text  x="98.29" y="783.5" ></text>
+</g>
+<g >
+<title>void [System.Private.CoreLib] System.Threading.ExecutionContext::RunFromThreadPoolDispatchLoop (12,305 samples, 88.23%)</title><rect x="138.8" y="789" width="1041.1" height="15.0" fill="rgb(244,126,46)" rx="2" ry="2" />
+<text  x="141.78" y="799.5" >void [System.Private.CoreLib] System.Threading.ExecutionContext::RunFromThreadPoolDispatchLoop</text>
+</g>
+<g >
+<title>futex_wait_queue_me (54 samples, 0.39%)</title><rect x="1182.6" y="869" width="4.5" height="15.0" fill="rgb(214,139,33)" rx="2" ry="2" />
+<text  x="1185.55" y="879.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (8 samples, 0.06%)</title><rect x="1187.5" y="933" width="0.6" height="15.0" fill="rgb(224,189,4)" rx="2" ry="2" />
+<text  x="1190.46" y="943.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (416 samples, 2.98%)</title><rect x="36.0" y="757" width="35.2" height="15.0" fill="rgb(231,216,44)" rx="2" ry="2" />
+<text  x="38.98" y="767.5" >pe..</text>
+</g>
+<g >
+<title>tcp_data_ready (3 samples, 0.02%)</title><rect x="20.2" y="165" width="0.2" height="15.0" fill="rgb(212,140,46)" rx="2" ry="2" />
+<text  x="23.15" y="175.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (735 samples, 5.27%)</title><rect x="32.5" y="821" width="62.2" height="15.0" fill="rgb(209,75,28)" rx="2" ry="2" />
+<text  x="35.51" y="831.5" >finish..</text>
+</g>
+<g >
+<title>x86_pmu_disable (3 samples, 0.02%)</title><rect x="1170.8" y="277" width="0.2" height="15.0" fill="rgb(249,205,0)" rx="2" ry="2" />
+<text  x="1173.79" y="287.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (14 samples, 0.10%)</title><rect x="22.0" y="933" width="1.2" height="15.0" fill="rgb(231,156,15)" rx="2" ry="2" />
+<text  x="25.01" y="943.5" ></text>
+</g>
+<g >
+<title>instance valuetype [System.Net.Primitives]System.Net.Sockets.SocketError [System.Net.Sockets] System.Net.Sockets.SocketAsyncContext::SendToAsync (2 samples, 0.01%)</title><rect x="138.0" y="693" width="0.2" height="15.0" fill="rgb(220,186,32)" rx="2" ry="2" />
+<text  x="141.02" y="703.5" ></text>
+</g>
+<g >
+<title>urandom_read_nowarn.isra.0 (2 samples, 0.01%)</title><rect x="139.3" y="549" width="0.2" height="15.0" fill="rgb(227,141,31)" rx="2" ry="2" />
+<text  x="142.29" y="559.5" ></text>
+</g>
+<g >
+<title>ip_output (4 samples, 0.03%)</title><rect x="19.1" y="725" width="0.3" height="15.0" fill="rgb(205,178,35)" rx="2" ry="2" />
+<text  x="22.05" y="735.5" ></text>
+</g>
+<g >
+<title>instance bool [System.Private.CoreLib] System.Threading.Tasks.Task::Wait (10 samples, 0.07%)</title><rect x="140.1" y="453" width="0.9" height="15.0" fill="rgb(233,116,35)" rx="2" ry="2" />
+<text  x="143.13" y="463.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (8 samples, 0.06%)</title><rect x="1187.5" y="789" width="0.6" height="15.0" fill="rgb(213,158,22)" rx="2" ry="2" />
+<text  x="1190.46" y="799.5" ></text>
+</g>
+<g >
+<title>sock_sendmsg (10 samples, 0.07%)</title><rect x="19.6" y="885" width="0.8" height="15.0" fill="rgb(217,43,32)" rx="2" ry="2" />
+<text  x="22.56" y="895.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb_core (3 samples, 0.02%)</title><rect x="19.1" y="517" width="0.2" height="15.0" fill="rgb(232,27,8)" rx="2" ry="2" />
+<text  x="22.05" y="527.5" ></text>
+</g>
+<g >
+<title>__libc_recv (7 samples, 0.05%)</title><rect x="18.8" y="965" width="0.6" height="15.0" fill="rgb(227,173,4)" rx="2" ry="2" />
+<text  x="21.80" y="975.5" ></text>
+</g>
+<g >
+<title>task_ctx_sched_out (3 samples, 0.02%)</title><rect x="133.1" y="773" width="0.3" height="15.0" fill="rgb(248,80,41)" rx="2" ry="2" />
+<text  x="136.11" y="783.5" ></text>
+</g>
+<g >
+<title>perf_event_update_userpage (68 samples, 0.49%)</title><rect x="85.5" y="693" width="5.7" height="15.0" fill="rgb(253,139,35)" rx="2" ry="2" />
+<text  x="88.47" y="703.5" ></text>
+</g>
+<g >
+<title>ret_from_fork (8 samples, 0.06%)</title><rect x="17.4" y="933" width="0.7" height="15.0" fill="rgb(232,125,15)" rx="2" ry="2" />
+<text  x="20.45" y="943.5" ></text>
+</g>
+<g >
+<title>perf_pmu_disable.part.0 (4 samples, 0.03%)</title><rect x="1170.3" y="293" width="0.3" height="15.0" fill="rgb(241,36,40)" rx="2" ry="2" />
+<text  x="1173.29" y="303.5" ></text>
+</g>
+<g >
+<title>recalc_sigpending (4 samples, 0.03%)</title><rect x="17.4" y="885" width="0.4" height="15.0" fill="rgb(220,67,14)" rx="2" ry="2" />
+<text  x="20.45" y="895.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (6 samples, 0.04%)</title><rect x="18.9" y="933" width="0.5" height="15.0" fill="rgb(246,191,2)" rx="2" ry="2" />
+<text  x="21.88" y="943.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Threading.Tasks.Task [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.ObjectResult::ExecuteResultAsync (2 samples, 0.01%)</title><rect x="1178.4" y="549" width="0.2" height="15.0" fill="rgb(236,3,34)" rx="2" ry="2" />
+<text  x="1181.41" y="559.5" ></text>
+</g>
+<g >
+<title>ctx_sched_out (3 samples, 0.02%)</title><rect x="1170.8" y="309" width="0.2" height="15.0" fill="rgb(206,124,39)" rx="2" ry="2" />
+<text  x="1173.79" y="319.5" ></text>
+</g>
+<g >
+<title>rb_next (4 samples, 0.03%)</title><rect x="1172.1" y="277" width="0.3" height="15.0" fill="rgb(224,94,31)" rx="2" ry="2" />
+<text  x="1175.06" y="287.5" ></text>
+</g>
+<g >
+<title>__netif_receive_skb_one_core (4 samples, 0.03%)</title><rect x="20.1" y="517" width="0.3" height="15.0" fill="rgb(206,94,16)" rx="2" ry="2" />
+<text  x="23.07" y="527.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (28 samples, 0.20%)</title><rect x="13.1" y="677" width="2.4" height="15.0" fill="rgb(245,214,49)" rx="2" ry="2" />
+<text  x="16.13" y="687.5" ></text>
+</g>
+<g >
+<title>perf_event_groups_first.isra.0 (8 samples, 0.06%)</title><rect x="1172.7" y="277" width="0.7" height="15.0" fill="rgb(214,87,21)" rx="2" ry="2" />
+<text  x="1175.74" y="287.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (12 samples, 0.09%)</title><rect x="1172.7" y="309" width="1.1" height="15.0" fill="rgb(237,196,14)" rx="2" ry="2" />
+<text  x="1175.74" y="319.5" ></text>
+</g>
+<g >
+<title>instance valuetype [System.Runtime]System.Threading.Tasks.ValueTask`1&lt;valuetype [System.IO.Pipelines]System.IO.Pipelines.FlushResult&gt; [Microsoft.AspNetCore.Server.Kestrel.Core] Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.Http1OutputProducer::FlushAsync (3 samples, 0.02%)</title><rect x="1177.6" y="453" width="0.2" height="15.0" fill="rgb(252,12,12)" rx="2" ry="2" />
+<text  x="1180.56" y="463.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (63 samples, 0.45%)</title><rect x="1182.1" y="949" width="5.4" height="15.0" fill="rgb(231,137,18)" rx="2" ry="2" />
+<text  x="1185.13" y="959.5" ></text>
+</g>
+<g >
+<title>sysvec_apic_timer_interrupt (30 samples, 0.22%)</title><rect x="1170.2" y="437" width="2.5" height="15.0" fill="rgb(241,33,19)" rx="2" ry="2" />
+<text  x="1173.20" y="447.5" ></text>
+</g>
+<g >
+<title>br_nf_pre_routing (3 samples, 0.02%)</title><rect x="19.1" y="485" width="0.2" height="15.0" fill="rgb(251,95,44)" rx="2" ry="2" />
+<text  x="22.05" y="495.5" ></text>
+</g>
+<g >
+<title>switch_fpu_return (4 samples, 0.03%)</title><rect x="17.8" y="869" width="0.3" height="15.0" fill="rgb(229,156,43)" rx="2" ry="2" />
+<text  x="20.78" y="879.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalSynchronizationManager::BlockThread (19 samples, 0.14%)</title><rect x="128.8" y="869" width="1.6" height="15.0" fill="rgb(213,32,49)" rx="2" ry="2" />
+<text  x="131.80" y="879.5" ></text>
+</g>
+<g >
+<title>_raw_spin_lock_irqsave (4 samples, 0.03%)</title><rect x="100.5" y="837" width="0.3" height="15.0" fill="rgb(225,95,4)" rx="2" ry="2" />
+<text  x="103.45" y="847.5" ></text>
+</g>
+<g >
+<title>__x64_sys_sched_yield (46 samples, 0.33%)</title><rect x="132.3" y="853" width="3.9" height="15.0" fill="rgb(222,35,10)" rx="2" ry="2" />
+<text  x="135.35" y="863.5" ></text>
+</g>
+<g >
+<title>ip_finish_output2 (4 samples, 0.03%)</title><rect x="19.1" y="677" width="0.3" height="15.0" fill="rgb(229,88,37)" rx="2" ry="2" />
+<text  x="22.05" y="687.5" ></text>
+</g>
+<g >
+<title>MethodDescCallSite::CallTargetWorker (7 samples, 0.05%)</title><rect x="1181.0" y="821" width="0.6" height="15.0" fill="rgb(250,34,38)" rx="2" ry="2" />
+<text  x="1184.03" y="831.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (16 samples, 0.11%)</title><rect x="1188.5" y="933" width="1.3" height="15.0" fill="rgb(252,92,54)" rx="2" ry="2" />
+<text  x="1191.48" y="943.5" ></text>
+</g>
+<g >
+<title>event_sched_in.isra.0 (28 samples, 0.20%)</title><rect x="13.1" y="693" width="2.4" height="15.0" fill="rgb(248,226,20)" rx="2" ry="2" />
+<text  x="16.13" y="703.5" ></text>
+</g>
+<g >
+<title>ip_local_out (4 samples, 0.03%)</title><rect x="20.1" y="725" width="0.3" height="15.0" fill="rgb(224,192,53)" rx="2" ry="2" />
+<text  x="23.07" y="735.5" ></text>
+</g>
+<g >
+<title>__calc_delta (5 samples, 0.04%)</title><rect x="134.4" y="757" width="0.4" height="15.0" fill="rgb(227,182,7)" rx="2" ry="2" />
+<text  x="137.38" y="767.5" ></text>
+</g>
+<g >
+<title>sched_clock_cpu (4 samples, 0.03%)</title><rect x="121.5" y="661" width="0.4" height="15.0" fill="rgb(246,168,27)" rx="2" ry="2" />
+<text  x="124.52" y="671.5" ></text>
+</g>
+<g >
+<title>newidle_balance (14 samples, 0.10%)</title><rect x="94.7" y="805" width="1.2" height="15.0" fill="rgb(240,82,48)" rx="2" ry="2" />
+<text  x="97.70" y="815.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_out (2 samples, 0.01%)</title><rect x="103.2" y="821" width="0.1" height="15.0" fill="rgb(238,144,4)" rx="2" ry="2" />
+<text  x="106.16" y="831.5" ></text>
+</g>
+<g >
+<title>do_softirq_own_stack (4 samples, 0.03%)</title><rect x="20.1" y="613" width="0.3" height="15.0" fill="rgb(213,181,16)" rx="2" ry="2" />
+<text  x="23.07" y="623.5" ></text>
+</g>
+<g >
+<title>void [System.Private.CoreLib] System.Threading.ExecutionContext::RunInternal (5 samples, 0.04%)</title><rect x="138.4" y="773" width="0.4" height="15.0" fill="rgb(253,87,22)" rx="2" ry="2" />
+<text  x="141.36" y="783.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Text.Encoding [Microsoft.AspNetCore.Mvc.Core] Microsoft.AspNetCore.Mvc.Formatters.TextOutputFormatter::SelectCharacterEncoding (2 samples, 0.01%)</title><rect x="1176.8" y="517" width="0.2" height="15.0" fill="rgb(217,31,8)" rx="2" ry="2" />
+<text  x="1179.80" y="527.5" ></text>
+</g>
+<g >
+<title>__prepare_exit_to_usermode (12 samples, 0.09%)</title><rect x="1172.7" y="389" width="1.1" height="15.0" fill="rgb(243,194,14)" rx="2" ry="2" />
+<text  x="1175.74" y="399.5" ></text>
+</g>
+<g >
+<title>__wake_up_common (2 samples, 0.01%)</title><rect x="20.2" y="37" width="0.2" height="15.0" fill="rgb(208,170,18)" rx="2" ry="2" />
+<text  x="23.24" y="47.5" ></text>
+</g>
+<g >
+<title>newidle_balance (4 samples, 0.03%)</title><rect x="1186.7" y="805" width="0.3" height="15.0" fill="rgb(224,128,51)" rx="2" ry="2" />
+<text  x="1189.70" y="815.5" ></text>
+</g>
+<g >
+<title>AppDomainTimerCallback (7 samples, 0.05%)</title><rect x="1181.0" y="885" width="0.6" height="15.0" fill="rgb(226,161,51)" rx="2" ry="2" />
+<text  x="1184.03" y="895.5" ></text>
+</g>
+<g >
+<title>task_ctx_sched_out (3 samples, 0.02%)</title><rect x="1170.8" y="325" width="0.2" height="15.0" fill="rgb(238,31,21)" rx="2" ry="2" />
+<text  x="1173.79" y="335.5" ></text>
+</g>
+<g >
+<title>tcp_send_ack (4 samples, 0.03%)</title><rect x="19.1" y="821" width="0.3" height="15.0" fill="rgb(248,101,40)" rx="2" ry="2" />
+<text  x="22.05" y="831.5" ></text>
+</g>
+<g >
+<title>MethodDescCallSite::CallTargetWorker (2 samples, 0.01%)</title><rect x="1189.8" y="869" width="0.2" height="15.0" fill="rgb(241,208,11)" rx="2" ry="2" />
+<text  x="1192.83" y="879.5" ></text>
+</g>
+<g >
+<title>fam_ops (3 samples, 0.02%)</title><rect x="136.7" y="805" width="0.2" height="15.0" fill="rgb(228,16,10)" rx="2" ry="2" />
+<text  x="139.66" y="815.5" ></text>
+</g>
+<g >
+<title>instance class [System.Runtime]System.Collections.Generic.IDictionary`2&lt;object,object&gt; [Microsoft.AspNetCore.Http] Microsoft.AspNetCore.Http.DefaultHttpContext::get_Items (2 samples, 0.01%)</title><rect x="139.5" y="693" width="0.1" height="15.0" fill="rgb(205,13,21)" rx="2" ry="2" />
+<text  x="142.46" y="703.5" ></text>
+</g>
+<g >
+<title>ktime_get_update_offsets_now (4 samples, 0.03%)</title><rect x="20.6" y="885" width="0.3" height="15.0" fill="rgb(242,117,13)" rx="2" ry="2" />
+<text  x="23.58" y="895.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (20 samples, 0.14%)</title><rect x="1174.1" y="405" width="1.7" height="15.0" fill="rgb(209,55,47)" rx="2" ry="2" />
+<text  x="1177.09" y="415.5" ></text>
+</g>
+<g >
+<title>instance object [Microsoft.Extensions.DependencyInjection] Microsoft.Extensions.DependencyInjection.ServiceLookup.ServiceProviderEngine::GetService (2 samples, 0.01%)</title><rect x="1178.4" y="501" width="0.2" height="15.0" fill="rgb(229,3,23)" rx="2" ry="2" />
+<text  x="1181.41" y="511.5" ></text>
+</g>
+<g >
+<title>pthread_cond_signal@@GLIBC_2.3.2 (14 samples, 0.10%)</title><rect x="22.0" y="965" width="1.2" height="15.0" fill="rgb(233,102,19)" rx="2" ry="2" />
+<text  x="25.01" y="975.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (60 samples, 0.43%)</title><rect x="11.1" y="773" width="5.1" height="15.0" fill="rgb(226,185,36)" rx="2" ry="2" />
+<text  x="14.10" y="783.5" ></text>
+</g>
+<g >
+<title>ip_local_deliver (3 samples, 0.02%)</title><rect x="20.2" y="261" width="0.2" height="15.0" fill="rgb(216,8,12)" rx="2" ry="2" />
+<text  x="23.15" y="271.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalSynchronizationManager::GetSynchControllersForObjects (3 samples, 0.02%)</title><rect x="130.4" y="869" width="0.3" height="15.0" fill="rgb(249,73,1)" rx="2" ry="2" />
+<text  x="133.40" y="879.5" ></text>
+</g>
+<g >
+<title>ip_finish_output2 (4 samples, 0.03%)</title><rect x="20.1" y="661" width="0.3" height="15.0" fill="rgb(227,168,37)" rx="2" ry="2" />
+<text  x="23.07" y="671.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4 samples, 0.03%)</title><rect x="1181.1" y="597" width="0.4" height="15.0" fill="rgb(253,104,2)" rx="2" ry="2" />
+<text  x="1184.12" y="607.5" ></text>
+</g>
+<g >
+<title>instance void [System.IO.Pipelines] System.IO.Pipelines.ThreadPoolScheduler::UnsafeSchedule (2 samples, 0.01%)</title><rect x="138.4" y="741" width="0.2" height="15.0" fill="rgb(242,23,29)" rx="2" ry="2" />
+<text  x="141.44" y="751.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge.constprop.0 (228 samples, 1.63%)</title><rect x="75.0" y="757" width="19.3" height="15.0" fill="rgb(205,34,9)" rx="2" ry="2" />
+<text  x="77.98" y="767.5" ></text>
+</g>
+<g >
+<title>CorUnix::CPalThread::ThreadEntry (3 samples, 0.02%)</title><rect x="1188.1" y="949" width="0.3" height="15.0" fill="rgb(242,1,11)" rx="2" ry="2" />
+<text  x="1191.14" y="959.5" ></text>
+</g>
+<g >
+<title>Thread::DoAppropriateWaitWorker (6 samples, 0.04%)</title><rect x="140.3" y="309" width="0.5" height="15.0" fill="rgb(224,132,36)" rx="2" ry="2" />
+<text  x="143.30" y="319.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge.constprop.0 (8 samples, 0.06%)</title><rect x="1186.0" y="757" width="0.7" height="15.0" fill="rgb(251,186,42)" rx="2" ry="2" />
+<text  x="1189.02" y="767.5" ></text>
+</g>
+<g >
+<title>lock_hrtimer_base (4 samples, 0.03%)</title><rect x="101.1" y="837" width="0.4" height="15.0" fill="rgb(208,104,14)" rx="2" ry="2" />
+<text  x="104.13" y="847.5" ></text>
+</g>
+<g >
+<title>ThreadPoolNative::RequestWorkerThread (3 samples, 0.02%)</title><rect x="1179.9" y="789" width="0.3" height="15.0" fill="rgb(207,88,51)" rx="2" ry="2" />
+<text  x="1182.93" y="799.5" ></text>
+</g>
+<g >
+<title>amd_pmu_wait_on_overflow (2 samples, 0.01%)</title><rect x="1170.8" y="245" width="0.2" height="15.0" fill="rgb(244,96,54)" rx="2" ry="2" />
+<text  x="1173.79" y="255.5" ></text>
+</g>
+</g>
+</svg>

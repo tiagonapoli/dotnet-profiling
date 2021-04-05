@@ -1,0 +1,5 @@
+obj
+bin
+.idea
+tmp
+**/trace.nettrace

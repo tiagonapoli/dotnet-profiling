@@ -1,0 +1,35 @@
+FROM mcr.microsoft.com/dotnet/sdk:5.0 AS build-env
+
+# Install the tools
+RUN dotnet tool install --tool-path /tools dotnet-symbol
+
+RUN export NETCORE_VERSION_AUX=$(ls /usr/share/dotnet/shared/Microsoft.NETCore.App/) && \ 
+    /tools/dotnet-symbol --symbols --output /tmp/symbols /usr/share/dotnet/shared/Microsoft.NETCore.App/$NETCORE_VERSION_AUX/libcoreclr.so
+
+WORKDIR /app
+COPY . .
+
+RUN dotnet restore
+
+RUN dotnet publish -c Release -o /app/out
+
+################################################
+FROM mcr.microsoft.com/dotnet/aspnet:5.0
+ENV LANG=en_US.UTF-8
+ENV ASPNETCORE_URLS=http://*:80
+
+RUN apt-get update && apt-get install -y \
+  strace \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build-env /tools /tools
+COPY --from=build-env /tmp/symbols /usr/lib/debug/usr/share/dotnet/shared/Microsoft.NETCore.App
+
+WORKDIR /app
+COPY --from=build-env /app/out .
+
+EXPOSE 80
+
+ENV COMPlus_PerfMapEnabled=1
+
+ENTRYPOINT ["dotnet", "webapi.dll"]
